@@ -483,8 +483,9 @@ export class BranchesService extends DrizzleService<Branch, Partial<Branch>, Bra
     branch: Branch;
     action: EnvironmentLifecycleAction;
     params?: BranchParams;
+    timeoutMs?: number;
   }): Promise<void> {
-    const { branch, action } = options;
+    const { branch, action, timeoutMs } = options;
     const { payload, asUser, env } = await this.createEnvironmentExecutorPayload(options);
 
     const result = await runExecutorCommand(payload, {
@@ -494,7 +495,7 @@ export class BranchesService extends DrizzleService<Branch, Partial<Branch>, Bra
       // Mixed webhook/shell restart needs the daemon to wait for shell stop
       // before it invokes the daemon-owned webhook start. Keep this generous
       // enough for docker compose down while still bounding the request.
-      timeoutMs: 10 * 60_000,
+      timeoutMs: timeoutMs ?? 10 * 60_000,
       templateVariables: {
         branch_id: branch.branch_id,
       },
@@ -1399,17 +1400,39 @@ export class BranchesService extends DrizzleService<Branch, Partial<Branch>, Bra
     // Hook chain enforces auth before we get here.
     const currentUserId = (params as AuthenticatedParams).user!.user_id as UUID;
 
-    // Stop environment if running
-    if (branch.environment_instance?.status === 'running') {
-      console.log(`⚠️  Stopping environment for branch ${branch.name} before ${metadataAction}`);
+    // Stop environment if ever active and non-stopped
+    const shouldAttemptStop =
+      branch.environment_instance != null && branch.environment_instance.status !== 'stopped';
+
+    let teardownSucceeded = true;
+    let teardownErrorMsg: string | undefined;
+
+    if (shouldAttemptStop) {
+      console.log(`⚠️  Tearing down environment for branch ${branch.name} before ${metadataAction}`);
       try {
-        await this.stopEnvironment(id, params);
+        await this.teardownEnvironmentForArchive(branch, params, 5 * 60_000);
       } catch (error) {
+        teardownErrorMsg = error instanceof Error ? error.message : String(error);
         console.warn(
-          `Failed to stop environment, continuing with ${metadataAction}:`,
-          error instanceof Error ? error.message : String(error)
+          `⚠️  Failed to stop environment during ${metadataAction} for ${branch.name}:`,
+          teardownErrorMsg
         );
+        teardownSucceeded = false;
       }
+    }
+
+    if (!teardownSucceeded && metadataAction === 'delete') {
+      throw new Error(
+        `Cannot permanently delete branch '${branch.name}': environment teardown failed (${teardownErrorMsg ?? 'unknown error'}). ` +
+          `Retry teardown or archive with filesystem preserved.`
+      );
+    }
+
+    const effectiveFilesystemAction = teardownSucceeded ? filesystemAction : 'preserved';
+    if (!teardownSucceeded && filesystemAction !== 'preserved') {
+      console.warn(
+        `⚠️  Preserving filesystem for ${branch.name} because environment teardown failed.`
+      );
     }
 
     // Perform filesystem action via executor (fire-and-forget)
@@ -1420,7 +1443,7 @@ export class BranchesService extends DrizzleService<Branch, Partial<Branch>, Bra
       sessionTokenService?: import('../services/session-token-service').SessionTokenService;
     };
 
-    if (filesystemAction === 'cleaned') {
+    if (effectiveFilesystemAction === 'cleaned') {
       console.log(`🧹 Spawning executor to clean branch filesystem: ${branch.path}`);
 
       // No user impersonation for infrastructure operations — the daemon user
@@ -1456,7 +1479,7 @@ export class BranchesService extends DrizzleService<Branch, Partial<Branch>, Bra
             error instanceof Error ? error.message : String(error)
           );
         });
-    } else if (filesystemAction === 'deleted') {
+    } else if (effectiveFilesystemAction === 'deleted') {
       console.log(`🗑️  Spawning executor to delete branch from filesystem: ${branch.path}`);
       const tenantId = params?.tenant?.tenant_id ?? getCurrentTenantId();
 
@@ -1511,7 +1534,9 @@ export class BranchesService extends DrizzleService<Branch, Partial<Branch>, Bra
     // Metadata action: archive or delete
     if (metadataAction === 'archive') {
       // Archive: Soft delete branch and cascade to sessions
-      console.log(`📦 Archiving branch: ${branch.name} (filesystem: ${filesystemAction})`);
+      console.log(
+        `📦 Archiving branch: ${branch.name} (filesystem requested: ${filesystemAction}, effective: ${effectiveFilesystemAction})`
+      );
 
       // Update branch
       const archivedBranch = await this.withTenantDatabase(params, () =>
@@ -1521,7 +1546,7 @@ export class BranchesService extends DrizzleService<Branch, Partial<Branch>, Bra
             archived: true,
             archived_at: new Date().toISOString(),
             archived_by: currentUserId,
-            filesystem_status: filesystemAction,
+            filesystem_status: effectiveFilesystemAction,
             // Preserve board_id + board_object placement so unarchive can restore in-place
             updated_at: new Date().toISOString(),
           },
@@ -2068,6 +2093,72 @@ export class BranchesService extends DrizzleService<Branch, Partial<Branch>, Bra
         params
       );
 
+      throw error;
+    }
+  }
+
+  /**
+   * Teardown environment synchronously during branch archive or delete.
+   *
+   * Awaits execution to ensure docker compose down or PID termination completes
+   * before any worktree filesystem cleanup runs. Supports shell commands,
+   * webhooks, and legacy process PID fallbacks.
+   */
+  private async teardownEnvironmentForArchive(
+    branch: Branch,
+    params?: BranchParams,
+    timeoutMs = 5 * 60_000
+  ): Promise<void> {
+    await this.updateEnvironment(branch.branch_id, { status: 'stopping' }, params);
+    try {
+      if (!branch.stop_command) {
+        // Legacy process fallback when no stop_command is configured
+        const managedProcess = this.processes.get(branch.branch_id);
+        if (managedProcess) {
+          managedProcess.process.kill('SIGTERM');
+          this.processes.delete(branch.branch_id);
+        } else if (branch.environment_instance?.process?.pid) {
+          try {
+            process.kill(branch.environment_instance.process.pid, 'SIGTERM');
+          } catch (error) {
+            console.warn(
+              `Failed to kill process ${branch.environment_instance.process.pid}: ${error}`
+            );
+          }
+        }
+      } else {
+        const execution = await this.resolveEnvironmentCommand(branch.stop_command, 'stop');
+        if (execution.kind === 'webhook') {
+          await this.executeEnvironmentWebhook({
+            url: execution.url,
+            branch,
+            commandType: 'stop',
+            triggeredBy: this.extractTriggeredBy(params),
+            maxBytes: 16 * 1024,
+          });
+        } else {
+          await this.runEnvironmentExecutor({ branch, action: 'stop', params, timeoutMs });
+        }
+      }
+
+      await this.updateEnvironment(
+        branch.branch_id,
+        { status: 'stopped', process: undefined },
+        params
+      );
+    } catch (error) {
+      await this.updateEnvironment(
+        branch.branch_id,
+        {
+          status: 'error',
+          last_health_check: {
+            timestamp: new Date().toISOString(),
+            status: 'unhealthy',
+            message: error instanceof Error ? error.message : 'Teardown failed during archive',
+          },
+        },
+        params
+      );
       throw error;
     }
   }

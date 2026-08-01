@@ -1227,6 +1227,231 @@ describe('BranchesService.archiveOrDelete', () => {
       })
     );
   });
+
+  describe('Issue #2099 Environment Teardown during archive & delete', () => {
+    it('triggers teardown for non-stopped environment and awaits executor completion', async () => {
+      const { service } = createServiceHarness();
+      const branchId = 'wt-archive-2099-active' as BranchID;
+      const userId = 'user-1' as UUID;
+
+      const teardownSpy = vi
+        .spyOn(service as never, 'teardownEnvironmentForArchive')
+        .mockResolvedValue(undefined as never);
+
+      vi.spyOn(service, 'get').mockResolvedValue({
+        branch_id: branchId,
+        name: 'WT Archive 2099 Active',
+        path: '/tmp/wt-archive-2099-active',
+        archived: false,
+        board_id: 'board-a',
+        filesystem_status: 'ready',
+        stop_command: 'docker compose down',
+        environment_instance: { status: 'error' }, // non-stopped status
+      } as never);
+      vi.spyOn(service, 'patch').mockResolvedValue({
+        branch_id: branchId,
+        archived: true,
+      } as never);
+
+      await service.archiveOrDelete(
+        branchId,
+        { metadataAction: 'archive', filesystemAction: 'cleaned' },
+        { user: { user_id: userId } } as never
+      );
+
+      expect(teardownSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ branch_id: branchId }),
+        expect.anything(),
+        5 * 60_000
+      );
+    });
+
+    it('bypasses teardown when environment is null or status is stopped', async () => {
+      const { service } = createServiceHarness();
+      const branchId = 'wt-archive-2099-inactive' as BranchID;
+      const userId = 'user-1' as UUID;
+
+      const teardownSpy = vi
+        .spyOn(service as never, 'teardownEnvironmentForArchive')
+        .mockResolvedValue(undefined as never);
+
+      // 1. null environment_instance
+      vi.spyOn(service, 'get').mockResolvedValueOnce({
+        branch_id: branchId,
+        name: 'WT Archive 2099 Null',
+        path: '/tmp/wt-archive-2099-null',
+        archived: false,
+        stop_command: 'docker compose down',
+        environment_instance: undefined,
+      } as never);
+      vi.spyOn(service, 'patch').mockResolvedValue({
+        branch_id: branchId,
+        archived: true,
+      } as never);
+
+      await service.archiveOrDelete(
+        branchId,
+        { metadataAction: 'archive', filesystemAction: 'preserved' },
+        { user: { user_id: userId } } as never
+      );
+      expect(teardownSpy).not.toHaveBeenCalled();
+
+      // 2. stopped environment_instance
+      vi.spyOn(service, 'get').mockResolvedValueOnce({
+        branch_id: branchId,
+        name: 'WT Archive 2099 Stopped',
+        path: '/tmp/wt-archive-2099-stopped',
+        archived: false,
+        stop_command: 'docker compose down',
+        environment_instance: { status: 'stopped' },
+      } as never);
+
+      await service.archiveOrDelete(
+        branchId,
+        { metadataAction: 'archive', filesystemAction: 'preserved' },
+        { user: { user_id: userId } } as never
+      );
+      expect(teardownSpy).not.toHaveBeenCalled();
+    });
+
+    it('aborts hard delete if environment teardown fails', async () => {
+      const { service } = createServiceHarness();
+      const branchId = 'wt-delete-2099-fail' as BranchID;
+      const userId = 'user-1' as UUID;
+
+      vi.spyOn(service as never, 'teardownEnvironmentForArchive').mockRejectedValue(
+        new Error('docker compose down failed')
+      );
+      vi.spyOn(service, 'get').mockResolvedValue({
+        branch_id: branchId,
+        name: 'WT Delete Fail',
+        path: '/tmp/wt-delete-fail',
+        archived: false,
+        stop_command: 'docker compose down',
+        environment_instance: { status: 'running' },
+      } as never);
+      const removeSpy = vi.spyOn(service, 'remove').mockResolvedValue({} as never);
+
+      await expect(
+        service.archiveOrDelete(
+          branchId,
+          { metadataAction: 'delete', filesystemAction: 'deleted' },
+          { user: { user_id: userId } } as never
+        )
+      ).rejects.toThrow(
+        /Cannot permanently delete branch 'WT Delete Fail': environment teardown failed/
+      );
+
+      expect(removeSpy).not.toHaveBeenCalled();
+    });
+
+    it('records filesystem_status: preserved when archive teardown fails', async () => {
+      const { service } = createServiceHarness();
+      const branchId = 'wt-archive-2099-fail' as BranchID;
+      const userId = 'user-1' as UUID;
+
+      vi.spyOn(service as never, 'teardownEnvironmentForArchive').mockRejectedValue(
+        new Error('docker compose down timed out')
+      );
+      vi.spyOn(service, 'get').mockResolvedValue({
+        branch_id: branchId,
+        name: 'WT Archive Fail',
+        path: '/tmp/wt-archive-fail',
+        archived: false,
+        stop_command: 'docker compose down',
+        environment_instance: { status: 'running' },
+      } as never);
+      const patchSpy = vi.spyOn(service, 'patch').mockResolvedValue({
+        branch_id: branchId,
+        archived: true,
+        filesystem_status: 'preserved',
+      } as never);
+
+      await service.archiveOrDelete(
+        branchId,
+        { metadataAction: 'archive', filesystemAction: 'cleaned' },
+        { user: { user_id: userId } } as never
+      );
+
+      expect(patchSpy).toHaveBeenCalledWith(
+        branchId,
+        expect.objectContaining({
+          archived: true,
+          filesystem_status: 'preserved', // fallback from requested 'cleaned'
+        }),
+        expect.anything()
+      );
+    });
+
+    it('SIGTERMs legacy process when no stop_command is set', async () => {
+      const { service } = createServiceHarness();
+      const branchId = 'wt-archive-2099-pid' as BranchID;
+      const userId = 'user-1' as UUID;
+
+      const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+      vi.spyOn(service, 'get').mockResolvedValue({
+        branch_id: branchId,
+        name: 'WT Archive PID',
+        path: '/tmp/wt-archive-pid',
+        archived: false,
+        environment_instance: { status: 'running', process: { pid: 12345 } },
+      } as never);
+      vi.spyOn(service, 'patch').mockResolvedValue({
+        branch_id: branchId,
+        archived: true,
+      } as never);
+
+      await service.archiveOrDelete(
+        branchId,
+        { metadataAction: 'archive', filesystemAction: 'preserved' },
+        { user: { user_id: userId } } as never
+      );
+
+      expect(killSpy).toHaveBeenCalledWith(12345, 'SIGTERM');
+      killSpy.mockRestore();
+    });
+
+    it('executes environment webhook when stop_command resolves to webhook', async () => {
+      const { service } = createServiceHarness();
+      const branchId = 'wt-archive-2099-webhook' as BranchID;
+      const userId = 'user-1' as UUID;
+
+      vi.spyOn(service as never, 'resolveEnvironmentCommand').mockResolvedValue({
+        kind: 'webhook',
+        url: 'http://example.com/stop-webhook',
+      } as never);
+      const webhookSpy = vi
+        .spyOn(service as never, 'executeEnvironmentWebhook')
+        .mockResolvedValue(undefined as never);
+
+      vi.spyOn(service, 'get').mockResolvedValue({
+        branch_id: branchId,
+        name: 'WT Archive Webhook',
+        path: '/tmp/wt-archive-webhook',
+        archived: false,
+        stop_command: 'webhook:http://example.com/stop-webhook',
+        environment_instance: { status: 'running' },
+      } as never);
+      vi.spyOn(service, 'patch').mockResolvedValue({
+        branch_id: branchId,
+        archived: true,
+      } as never);
+
+      await service.archiveOrDelete(
+        branchId,
+        { metadataAction: 'archive', filesystemAction: 'preserved' },
+        { user: { user_id: userId } } as never
+      );
+
+      expect(webhookSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          url: 'http://example.com/stop-webhook',
+          commandType: 'stop',
+        })
+      );
+    });
+  });
 });
 
 describe('BranchesService.find zone filtering', () => {

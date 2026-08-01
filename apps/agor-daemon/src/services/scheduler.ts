@@ -85,7 +85,10 @@ import {
 import Handlebars from 'handlebars';
 import type { Application } from '../declarations';
 import { emitServiceEvent } from '../utils/emit-service-event.js';
+import { DockerContainerReaper } from './docker-container-reaper.js';
 import type { SessionParams } from './sessions.js';
+
+const REAP_INTERVAL_MS = 15 * 60_000; // 15 minutes (#2099)
 
 /**
  * Session statuses that count as "actively consuming the branch" for
@@ -278,6 +281,8 @@ export class SchedulerService {
   private sessionRepo: SessionRepository;
   private userRepo: UsersRepository;
   private sessionMCPRepo: SessionMCPServerRepository;
+  private containerReaper: DockerContainerReaper;
+  private lastReapTimestamp = 0;
 
   constructor(db: TenantScopeAwareDatabase, app: Application, config: SchedulerConfig = {}) {
     this.app = app;
@@ -297,6 +302,7 @@ export class SchedulerService {
     this.sessionRepo = new SessionRepository(db);
     this.userRepo = new UsersRepository(db);
     this.sessionMCPRepo = new SessionMCPServerRepository(db);
+    this.containerReaper = new DockerContainerReaper(app);
   }
 
   private withTenantDatabase<T>(work: () => Promise<T>): Promise<T> {
@@ -357,9 +363,18 @@ export class SchedulerService {
    *    lock (Postgres only; no-op on SQLite). On miss, skip — another
    *    daemon is handling that one.
    * 3. Process the schedule (dedup, concurrency check, spawn).
+   * 4. Periodically run Docker container reconciliation sweep (#2099).
    */
   private async tick(): Promise<void> {
     const now = Date.now();
+
+    // Trigger Docker container reaper sweep every 15 minutes (#2099)
+    if (now - this.lastReapTimestamp >= REAP_INTERVAL_MS) {
+      this.lastReapTimestamp = now;
+      this.containerReaper.runReconciliationPass().catch((error) => {
+        console.warn('⚠️ [DockerReaper] Background sweep failed:', error);
+      });
+    }
 
     try {
       const dueScheduleRefs = await this.findDueScheduleRefs(now);
