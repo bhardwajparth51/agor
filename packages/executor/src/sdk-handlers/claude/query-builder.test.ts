@@ -70,6 +70,28 @@ import { AgorSetupError, ClaudeExecutionError } from './claude-error.js';
 import { CLAUDE_CODE_DISALLOWED_TOOLS, CLAUDE_CODE_TODO_TOOLS } from './constants.js';
 import { formatListForLog, type QuerySetupDeps, setupQuery } from './query-builder.js';
 
+/** Minimal deps stub shared by the sync-failure and setup-error describe blocks. */
+function createMinimalQueryDeps(): QuerySetupDeps {
+  return {
+    sessionsRepo: {
+      findById: vi.fn().mockResolvedValue({
+        session_id: 'test-session' as SessionID,
+        branch_id: 'test-branch' as BranchID,
+        mcp_token: 'token',
+      }),
+    } as any,
+    branchesRepo: { findById: vi.fn().mockResolvedValue({ path: '/test/project/path' }) } as any,
+    messagesRepo: {} as any,
+    sessionMCPRepo: {} as any,
+    mcpServerRepo: {} as any,
+    permissionService: {} as any,
+    tasksService: {} as any,
+    messagesService: {} as any,
+    sessionsService: {} as any,
+    permissionLocks: new Map(),
+  };
+}
+
 describe('MCP logging helpers', () => {
   it('formats long server lists without dumping every entry', () => {
     expect(formatListForLog(['a', 'b', 'c'], 5)).toBe('a, b, c');
@@ -1611,27 +1633,6 @@ describe('setupQuery - tool names the CLI has to rewrite', () => {
 });
 
 describe('setupQuery - synchronous Claude.query failures', () => {
-  function createDeps(): QuerySetupDeps {
-    return {
-      sessionsRepo: {
-        findById: vi.fn().mockResolvedValue({
-          session_id: 'test-session' as SessionID,
-          branch_id: 'test-branch' as BranchID,
-          mcp_token: 'token',
-        }),
-      } as any,
-      branchesRepo: { findById: vi.fn().mockResolvedValue({ path: '/test/project/path' }) } as any,
-      messagesRepo: {} as any,
-      sessionMCPRepo: {} as any,
-      mcpServerRepo: {} as any,
-      permissionService: {} as any,
-      tasksService: {} as any,
-      messagesService: {} as any,
-      sessionsService: {} as any,
-      permissionLocks: new Map(),
-    };
-  }
-
   it('sanitizes synchronous Claude.query failures without generic MCP error masking', async () => {
     claudeQuery.mockImplementationOnce(() => {
       throw new Error(
@@ -1639,7 +1640,11 @@ describe('setupQuery - synchronous Claude.query failures', () => {
       );
     });
 
-    const pending = setupQuery('test-session' as SessionID, 'test prompt', createDeps());
+    const pending = setupQuery(
+      'test-session' as SessionID,
+      'test prompt',
+      createMinimalQueryDeps()
+    );
     await expect(pending).rejects.toMatchObject({ category: 'authentication' });
     const error = await pending.catch((err: unknown) => err as Error);
     expect(error.message).not.toContain('The MCP operation failed');
@@ -1647,29 +1652,8 @@ describe('setupQuery - synchronous Claude.query failures', () => {
 });
 
 describe('setupQuery - setup error handling', () => {
-  function createDeps(): QuerySetupDeps {
-    return {
-      sessionsRepo: {
-        findById: vi.fn().mockResolvedValue({
-          session_id: 'test-session' as SessionID,
-          branch_id: 'test-branch' as BranchID,
-          mcp_token: 'token',
-        }),
-      } as any,
-      branchesRepo: { findById: vi.fn().mockResolvedValue({ path: '/test/project/path' }) } as any,
-      messagesRepo: {} as any,
-      sessionMCPRepo: {} as any,
-      mcpServerRepo: {} as any,
-      permissionService: {} as any,
-      tasksService: {} as any,
-      messagesService: {} as any,
-      sessionsService: {} as any,
-      permissionLocks: new Map(),
-    };
-  }
-
   it('throws AgorSetupError when session is not found', async () => {
-    const d = createDeps();
+    const d = createMinimalQueryDeps();
     (d.sessionsRepo.findById as any).mockResolvedValue(null);
 
     await expect(setupQuery('missing-session' as SessionID, 'prompt', d)).rejects.toSatisfy(
@@ -1682,7 +1666,7 @@ describe('setupQuery - setup error handling', () => {
   });
 
   it('throws AgorSetupError when working directory validation fails', async () => {
-    const d = createDeps();
+    const d = createMinimalQueryDeps();
     const { validateDirectory } = await import('@agor/core/lib/validation');
     vi.mocked(validateDirectory).mockRejectedValueOnce(
       new Error('Working directory does not exist: /missing/path')
@@ -1728,7 +1712,7 @@ describe('setupQuery - setup error handling', () => {
     );
     vi.mocked(loadManagedAgenticToolSdk).mockRejectedValueOnce(exitError);
 
-    const d = createDeps();
+    const d = createMinimalQueryDeps();
     await expect(setupQuery('test-session' as SessionID, 'test prompt', d)).rejects.toSatisfy(
       (err: unknown) => {
         expect(err).toBeInstanceOf(ClaudeExecutionError);
@@ -1752,7 +1736,7 @@ describe('setupQuery - setup error handling', () => {
     const plainError = new Error('Failed to resolve dynamic SDK bundle');
     vi.mocked(loadManagedAgenticToolSdk).mockRejectedValueOnce(plainError);
 
-    const d = createDeps();
+    const d = createMinimalQueryDeps();
     await expect(setupQuery('test-session' as SessionID, 'test prompt', d)).rejects.toSatisfy(
       (err: unknown) => {
         expect(err).toBeInstanceOf(ClaudeExecutionError);

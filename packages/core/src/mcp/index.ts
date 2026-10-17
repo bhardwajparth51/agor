@@ -11,6 +11,8 @@ export {
 export {
   asMCPExternalError,
   isMCPAbortError,
+  MCP_EXTERNAL_CATEGORIES,
+  MCP_EXTERNAL_ERROR_CATEGORIES,
   MCPExternalError,
   type MCPExternalErrorAction,
   type MCPExternalErrorCategory,

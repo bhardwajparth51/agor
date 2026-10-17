@@ -17,13 +17,16 @@ export const MCP_EXTERNAL_ERROR_STAGES = [
 ] as const;
 
 export type MCPExternalErrorStage = (typeof MCP_EXTERNAL_ERROR_STAGES)[number];
-export type MCPExternalErrorCategory =
-  | 'provider_unavailable'
-  | 'provider_rejected'
-  | 'invalid_response'
-  | 'storage_policy_rejected'
-  | 'configuration_required'
-  | 'unknown';
+export const MCP_EXTERNAL_CATEGORIES = [
+  'provider_unavailable',
+  'provider_rejected',
+  'invalid_response',
+  'storage_policy_rejected',
+  'configuration_required',
+  'unknown',
+] as const;
+export const MCP_EXTERNAL_ERROR_CATEGORIES = MCP_EXTERNAL_CATEGORIES;
+export type MCPExternalErrorCategory = (typeof MCP_EXTERNAL_CATEGORIES)[number];
 export type MCPExternalErrorAction =
   | 'retry'
   | 'reauthenticate'

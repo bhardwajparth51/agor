@@ -124,6 +124,13 @@ export class ClaudePromptService {
   /** Serialize permission checks per session to prevent duplicate prompts for concurrent tool calls */
   private permissionLocks = new Map<SessionID, Promise<void>>();
 
+  /** Logger used for failure reporting, defaults to console */
+  public logger: {
+    error: (...args: unknown[]) => void;
+    warn?: (...args: unknown[]) => void;
+    log?: (...args: unknown[]) => void;
+  } = console;
+
   constructor(
     private messagesRepo: MessagesRepository,
     private sessionsRepo: SessionRepository,
@@ -247,41 +254,13 @@ If you continue to see authentication errors, please contact your Agor administr
       }
     }
 
-    let setupResult: Awaited<ReturnType<typeof setupQuery>>;
-    try {
-      setupResult = await setupQuery(
-        sessionId,
-        prompt,
-        {
-          sessionsRepo: this.sessionsRepo,
-          reposRepo: this.reposRepo,
-          messagesRepo: this.messagesRepo,
-          apiKey: this.apiKey,
-          sessionMCPRepo: this.sessionMCPRepo,
-          mcpServerRepo: this.mcpServerRepo,
-          permissionService: this.permissionService,
-          tasksService: this.tasksService,
-          mcpEnabled: this.mcpEnabled,
-          sessionsService: this.sessionsService,
-          messagesService: this.messagesService,
-          branchesRepo: this.branchesRepo,
-          usersRepo: this.usersRepo,
-          mcpOAuthAuthHeadersRepo: this.mcpOAuthAuthHeadersRepo,
-          permissionLocks: this.permissionLocks,
-        },
-        {
-          taskId,
-          permissionMode,
-          resume: true,
-          abortController,
-          promptOrigin,
-        }
-      );
-    } catch (error) {
-      const safe = sanitizeClaudeExecutionError(error);
-      logClaudeFailure('❌ Query setup failed:', safe, { sessionId: shortId(sessionId) });
-      throw safe;
-    }
+    const setupResult = await this._setupQuerySafe(sessionId, prompt, {
+      taskId,
+      permissionMode,
+      resume: true,
+      abortController,
+      promptOrigin,
+    });
 
     const { query: result, getStderrMetadata, refreshMcp } = setupResult;
 
@@ -297,6 +276,7 @@ If you continue to see authentication errors, please contact your Agor administr
     });
     const backgroundTasks = new ClaudeBackgroundTaskLifecycle();
     const sdkResults: SDKResultMessage[] = [];
+    let contextUsageWarnedThisSession = false;
     const clearBackgroundTaskActivity = () => {
       const activeTaskCount = backgroundTasks.clearActiveTasks();
       for (let index = 0; index < activeTaskCount; index++) {
@@ -371,7 +351,7 @@ If you continue to see authentication errors, please contact your Agor administr
             // with a fixed event name + bounded key=value fields (no per-turn
             // chatter; the normal held/settled paths log at most once each).
             console.warn(
-              `⚠️  event=${BACKGROUND_TASK_TIMEOUT_EVENT} tasks=${abandonedTaskCount} timeout_ms=${timeoutMs} — agent ended its turn with background work still running; none reported completion in time, so the turn was settled and the background work was stopped`
+              `[executor:warn] event=${BACKGROUND_TASK_TIMEOUT_EVENT} tasks=${abandonedTaskCount} timeout_ms=${timeoutMs} — agent ended its turn with background work still running; none reported completion in time, so the turn was settled and the background work was stopped`
             );
             yield {
               type: 'sdk_event',
@@ -466,7 +446,7 @@ If you continue to see authentication errors, please contact your Agor administr
               console.log(`💾 Stored Agent SDK session_id in database`);
             } else if (existingSdkSessionId && existingSdkSessionId !== event.agentSessionId) {
               console.warn(
-                `⚠️  SDK returned new session_id ${shortId(event.agentSessionId)} but session already has ${shortId(existingSdkSessionId)} — keeping original`
+                `[executor:warn] SDK returned new session_id ${shortId(event.agentSessionId)} but session already has ${shortId(existingSdkSessionId)} — keeping original`
               );
             }
             continue; // Don't yield this event upstream
@@ -497,7 +477,7 @@ If you continue to see authentication errors, please contact your Agor administr
               ) {
                 const stderr = getStderrMetadata();
                 console.error(
-                  `❌ [claude-code] error result for session ${shortId(sessionId)} ` +
+                  `[executor:error] [claude-code] error result for session ${shortId(sessionId)} ` +
                     `subtype=${safeResult?.subtype ?? 'unknown'} ` +
                     `is_error=${safeResult?.is_error ?? 'unknown'} ` +
                     `num_turns=${safeResult?.num_turns ?? 'unknown'} ` +
@@ -526,7 +506,7 @@ If you continue to see authentication errors, please contact your Agor administr
                 );
                 if (contextUsage === AWAIT_TIMEOUT) {
                   console.warn(
-                    `⚠️  getContextUsage() did not respond within ${ClaudePromptService.CONTEXT_USAGE_TIMEOUT_MS}ms; settling turn without a context snapshot`
+                    `[executor:warn] getContextUsage() did not respond within ${ClaudePromptService.CONTEXT_USAGE_TIMEOUT_MS}ms; settling turn without a context snapshot`
                   );
                 } else {
                   const snapshot = projectContextUsageSnapshot(contextUsage);
@@ -534,14 +514,19 @@ If you continue to see authentication errors, please contact your Agor administr
                     yield { type: 'context_usage', contextUsage: snapshot } as ProcessedEvent;
                   } else {
                     console.warn(
-                      '⚠️  getContextUsage() returned an invalid context snapshot; settling turn without it'
+                      '[executor:warn] getContextUsage() returned an invalid context snapshot; settling turn without it'
                     );
                   }
                 }
               } catch (error) {
-                const safe = sanitizeClaudeExecutionError(error);
-                const category = 'category' in safe ? safe.category : 'unknown';
-                console.warn(`⚠️  getContextUsage() unavailable category=${category}`);
+                if (!contextUsageWarnedThisSession) {
+                  contextUsageWarnedThisSession = true;
+                  const safe = sanitizeClaudeExecutionError(error);
+                  const category = 'category' in safe ? safe.category : 'unknown';
+                  console.warn(
+                    `[executor:warn] getContextUsage() unavailable category=${category} (suppressing further warnings for this session)`
+                  );
+                }
               } finally {
                 // Release the held input iterable so the SDK can close stdin
                 result.releaseInput();
@@ -578,7 +563,9 @@ If you continue to see authentication errors, please contact your Agor administr
       // Check if this is an AbortError from AbortController.abort()
       // This is EXPECTED during stop - the SDK throws AbortError when cancelled
       if (isMCPAbortError(error) || isClaudeAbortError(error)) {
-        console.log(`🛑 [Stop] Query aborted for session ${shortId(sessionId)} - this is expected`);
+        console.log(
+          `[executor:stop] Query aborted for session ${shortId(sessionId)} - this is expected`
+        );
         // Yield stopped event to signal execution was halted
         yield { type: 'stopped' } as ProcessedEvent;
         // Don't throw - this is a clean stop, not an error
@@ -589,12 +576,17 @@ If you continue to see authentication errors, please contact your Agor administr
       // provider payloads. Retain only presence + closed failure metadata.
       const stderr = getStderrMetadata();
       const safe = sanitizeClaudeExecutionError(error);
-      logClaudeFailure('❌ SDK iteration failed:', safe, {
-        sessionId: shortId(sessionId),
-        taskId: taskId ? shortId(taskId) : undefined,
-        messageCount: state.messageCount,
-        hasStderr: stderr.hasStderr,
-      });
+      logClaudeFailure(
+        '[executor:error] SDK iteration failed:',
+        safe,
+        {
+          sessionId: shortId(sessionId),
+          taskId: taskId ? shortId(taskId) : undefined,
+          messageCount: state.messageCount,
+          hasStderr: stderr.hasStderr,
+        },
+        this.logger
+      );
       throw safe;
     } finally {
       unregisterMcpRefresh?.();
@@ -636,39 +628,11 @@ If you continue to see authentication errors, please contact your Agor administr
    * @returns Complete assistant response with metadata
    */
   async promptSession(sessionId: SessionID, prompt: string): Promise<PromptResult> {
-    let setupResult: Awaited<ReturnType<typeof setupQuery>>;
-    try {
-      setupResult = await setupQuery(
-        sessionId,
-        prompt,
-        {
-          sessionsRepo: this.sessionsRepo,
-          reposRepo: this.reposRepo,
-          messagesRepo: this.messagesRepo,
-          apiKey: this.apiKey,
-          sessionMCPRepo: this.sessionMCPRepo,
-          mcpServerRepo: this.mcpServerRepo,
-          permissionService: this.permissionService,
-          tasksService: this.tasksService,
-          mcpEnabled: this.mcpEnabled,
-          sessionsService: this.sessionsService,
-          messagesService: this.messagesService,
-          branchesRepo: this.branchesRepo,
-          usersRepo: this.usersRepo,
-          mcpOAuthAuthHeadersRepo: this.mcpOAuthAuthHeadersRepo,
-          permissionLocks: this.permissionLocks,
-        },
-        {
-          taskId: undefined,
-          permissionMode: undefined,
-          resume: false,
-        }
-      );
-    } catch (error) {
-      const safe = sanitizeClaudeExecutionError(error);
-      logClaudeFailure('❌ Query setup failed:', safe, { sessionId: shortId(sessionId) });
-      throw safe;
-    }
+    const setupResult = await this._setupQuerySafe(sessionId, prompt, {
+      taskId: undefined,
+      permissionMode: undefined,
+      resume: false,
+    });
 
     const { query: result } = setupResult;
 
@@ -739,7 +703,7 @@ If you continue to see authentication errors, please contact your Agor administr
       // Check if this is an AbortError from interrupt() - this is EXPECTED during stop
       if (isMCPAbortError(error) || isClaudeAbortError(error)) {
         console.log(
-          `🛑 [Stop] Query aborted via interrupt() for session ${shortId(sessionId)} (non-streaming) - this is expected`
+          `[executor:stop] Query aborted via interrupt() for session ${shortId(sessionId)} (non-streaming) - this is expected`
         );
         // Don't throw - this is a clean stop, not an error
         // Return empty result since we were stopped
@@ -773,10 +737,57 @@ If you continue to see authentication errors, please contact your Agor administr
    */
   async stopTask(sessionId: SessionID): Promise<{ success: boolean; reason?: string }> {
     console.log(
-      `🛑 [Deprecated] stopTask called for session ${shortId(sessionId)} - actual stop handled by AbortController`
+      `[executor:stop] [Deprecated] stopTask called for session ${shortId(sessionId)} - actual stop handled by AbortController`
     );
     // Cancellation is now handled by AbortController passed to SDK
     // This method is kept for API compatibility
     return { success: true };
+  }
+
+  /**
+   * Builds and invokes setupQuery with all repository dependencies from this service instance,
+   * then sanitizes and logs any failure before re-throwing.
+   *
+   * Centralises the repeated try/catch boilerplate that was duplicated between
+   * promptSessionStreaming and promptSession.
+   */
+  private async _setupQuerySafe(
+    sessionId: SessionID,
+    prompt: string,
+    options: Parameters<typeof setupQuery>[3]
+  ): Promise<Awaited<ReturnType<typeof setupQuery>>> {
+    try {
+      return await setupQuery(
+        sessionId,
+        prompt,
+        {
+          sessionsRepo: this.sessionsRepo,
+          reposRepo: this.reposRepo,
+          messagesRepo: this.messagesRepo,
+          apiKey: this.apiKey,
+          sessionMCPRepo: this.sessionMCPRepo,
+          mcpServerRepo: this.mcpServerRepo,
+          permissionService: this.permissionService,
+          tasksService: this.tasksService,
+          mcpEnabled: this.mcpEnabled,
+          sessionsService: this.sessionsService,
+          messagesService: this.messagesService,
+          branchesRepo: this.branchesRepo,
+          usersRepo: this.usersRepo,
+          mcpOAuthAuthHeadersRepo: this.mcpOAuthAuthHeadersRepo,
+          permissionLocks: this.permissionLocks,
+        },
+        options
+      );
+    } catch (error) {
+      const safe = sanitizeClaudeExecutionError(error);
+      logClaudeFailure(
+        '[executor:error] Query setup failed:',
+        safe,
+        { sessionId: shortId(sessionId) },
+        this.logger
+      );
+      throw safe;
+    }
   }
 }

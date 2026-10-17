@@ -141,6 +141,16 @@ describe('sanitizeClaudeExecutionError', () => {
     expect((sanitizeClaudeExecutionError(unknownCategory) as ClaudeExecutionError).category).toBe(
       'unknown'
     );
+
+    const missingStage = {
+      name: 'MCPExternalError',
+      category: 'provider_rejected',
+      diagnostic: { message: 'oauth expired' },
+      message: 'The MCP operation failed: provider_rejected',
+    };
+    expect((sanitizeClaudeExecutionError(missingStage) as ClaudeExecutionError).category).toBe(
+      'unknown'
+    );
   });
 
   it('prevents URLs, tokens, and filesystem paths from leaking in user-facing message', () => {
@@ -153,6 +163,13 @@ describe('sanitizeClaudeExecutionError', () => {
     expect(sanitized.message).not.toContain('sk-ant');
     expect(sanitized.message).not.toContain('/home/');
     expect(sanitized.cause).toBe(rawError);
+  });
+
+  it('cause is not enumerable in JSON serialization', () => {
+    const raw = new Error('sk-ant-secret-token in the message');
+    const sanitized = sanitizeClaudeExecutionError(raw);
+    const json = JSON.stringify(sanitized);
+    expect(json).not.toContain('sk-ant-secret-token');
   });
 
   it('passes through AgorSetupError and MissingCredentialError', () => {
@@ -180,35 +197,85 @@ describe('isClaudeAbortError', () => {
 
 describe('logClaudeFailure', () => {
   it('logs category, message, and diagnostic fields', () => {
-    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
-    try {
-      const err = new ClaudeExecutionError('process_failure', MESSAGES.processExit(137), {
-        exitCode: 137,
-        signal: 'SIGKILL',
-      });
-      logClaudeFailure('Failure label', err, { extra: true });
-      expect(spy).toHaveBeenCalledWith('Failure label', {
-        extra: true,
-        category: 'process_failure',
-        message: MESSAGES.processExit(137),
-        exitCode: 137,
-        signal: 'SIGKILL',
-        errorClass: undefined,
-        code: undefined,
-      });
+    const mockLogger = { error: vi.fn() };
+    const err = new ClaudeExecutionError('process_failure', MESSAGES.processExit(137), {
+      exitCode: 137,
+      signal: 'SIGKILL',
+    });
+    logClaudeFailure('Failure label', err, { extra: true }, mockLogger);
+    expect(mockLogger.error).toHaveBeenCalledWith('Failure label', {
+      extra: true,
+      category: 'process_failure',
+      message: MESSAGES.processExit(137),
+      exitCode: 137,
+      signal: 'SIGKILL',
+      errorClass: undefined,
+      code: undefined,
+    });
 
-      const setupErr = new AgorSetupError('Working directory unavailable');
-      logClaudeFailure('Setup failed', setupErr);
-      expect(spy).toHaveBeenCalledWith('Setup failed', {
-        category: 'setup_error',
-        message: 'Working directory unavailable',
-        exitCode: undefined,
-        signal: undefined,
-        errorClass: undefined,
-        code: undefined,
-      });
-    } finally {
-      spy.mockRestore();
-    }
+    const setupErr = new AgorSetupError('Working directory unavailable');
+    logClaudeFailure('Setup failed', setupErr, undefined, mockLogger);
+    expect(mockLogger.error).toHaveBeenCalledWith('Setup failed', {
+      category: 'setup_error',
+      message: 'Working directory unavailable',
+      exitCode: undefined,
+      signal: undefined,
+      errorClass: undefined,
+      code: undefined,
+    });
+  });
+});
+
+describe('sanitizeClaudeExecutionError — priority ordering', () => {
+  it('P1 beats P13: executable_not_found errorClass wins over a non-zero exitCode in the same error', () => {
+    const err = Object.assign(new Error('not found'), {
+      errorClass: 'executable_not_found',
+      exitCode: 127,
+    });
+    const result = sanitizeClaudeExecutionError(err) as ClaudeExecutionError;
+    expect(result.category).toBe('process_failure');
+    expect(result.message).toBe(MESSAGES.executableNotFound); // not processExit(127)
+  });
+
+  it('P4 (HTTP 403) beats P5 (HTTP 401) when both status and message disagree', () => {
+    // Status field says 403, message says "401 unauthorized" — structured field wins
+    const err = Object.assign(new Error('401 unauthorized from proxy'), { status: 403 });
+    const result = sanitizeClaudeExecutionError(err) as ClaudeExecutionError;
+    expect(result.category).toBe('authentication');
+    expect(result.message).toBe(MESSAGES.forbidden); // 403 message, not 401
+  });
+
+  it('P5 (auth) beats P6 (missing_credential) when message contains both signals', () => {
+    // Invalid API key message that also mentions "not logged in" — auth must win
+    const err = new Error('invalid api key: not logged in');
+    const result = sanitizeClaudeExecutionError(err) as ClaudeExecutionError;
+    expect(result.category).toBe('authentication');
+    expect(result.message).toBe(MESSAGES.authentication);
+  });
+
+  it('P8 (rate_limit) beats P13 (process_failure) when exit code and 429 both present', () => {
+    const err = Object.assign(new Error('rate limit exceeded'), {
+      exitCode: 1,
+      errorClass: 'process_exited_nonzero',
+    });
+    const result = sanitizeClaudeExecutionError(err) as ClaudeExecutionError;
+    expect(result.category).toBe('rate_limit');
+  });
+
+  it('P13 (process_failure) fires for a plain non-zero exit with no other signals', () => {
+    const err = Object.assign(new Error('exited with code 137'), {
+      exitCode: 137,
+      errorClass: 'process_exited_nonzero',
+    });
+    const result = sanitizeClaudeExecutionError(err) as ClaudeExecutionError;
+    expect(result.category).toBe('process_failure');
+    expect(result.message).toBe(MESSAGES.processExit(137));
+  });
+
+  it('P14 (unknown) fires when no rule matches', () => {
+    const err = new Error('completely unrecognised error format xyz');
+    const result = sanitizeClaudeExecutionError(err) as ClaudeExecutionError;
+    expect(result.category).toBe('unknown');
+    expect(result.message).toBe(MESSAGES.unknown);
   });
 });

@@ -244,7 +244,7 @@ export async function setupQuery(
     }
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
-    console.error(`❌ Working directory validation failed: ${errorMessage}`);
+    console.error(`[executor:error] Working directory validation failed: ${errorMessage}`);
     const branchSuffix = session.branch_id
       ? ` Session references branch ${session.branch_id} which may not be initialized.`
       : ' The branch may not be initialized.';

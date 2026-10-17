@@ -213,47 +213,41 @@ describe('ClaudePromptService error handling', () => {
     expect(events).toEqual([{ type: 'stopped' }]);
   });
 
-  it('logs failure via console.error with category and message when setupQuery rejects', async () => {
-    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-    try {
-      mockSetupQuery.mockRejectedValue(new Error('Working directory unavailable'));
-      const service = new ClaudePromptService();
-      await expect(
-        service.promptSessionStreaming(testSessionId, 'test prompt').next()
-      ).rejects.toThrow();
+  it('logs failure via logger with category and message when setupQuery rejects', async () => {
+    const mockLogger = { error: vi.fn() };
+    mockSetupQuery.mockRejectedValue(new Error('Working directory unavailable'));
+    const service = new ClaudePromptService();
+    service.logger = mockLogger;
+    await expect(
+      service.promptSessionStreaming(testSessionId, 'test prompt').next()
+    ).rejects.toThrow();
 
-      expect(errorSpy).toHaveBeenCalledWith(
-        '❌ Query setup failed:',
-        expect.objectContaining({
-          category: expect.any(String),
-          message: expect.any(String),
-        })
-      );
-    } finally {
-      errorSpy.mockRestore();
-    }
+    expect(mockLogger.error).toHaveBeenCalledWith(
+      '[executor:error] Query setup failed:',
+      expect.objectContaining({
+        category: expect.any(String),
+        message: expect.any(String),
+      })
+    );
   });
 
   it('logs AgorSetupError with setup_error category when setupQuery rejects with AgorSetupError', async () => {
-    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-    try {
-      mockSetupQuery.mockRejectedValue(
-        new AgorSetupError('Working directory for this session is unavailable.')
-      );
-      const service = new ClaudePromptService();
-      await expect(
-        service.promptSessionStreaming(testSessionId, 'test prompt').next()
-      ).rejects.toThrow();
+    const mockLogger = { error: vi.fn() };
+    mockSetupQuery.mockRejectedValue(
+      new AgorSetupError('Working directory for this session is unavailable.')
+    );
+    const service = new ClaudePromptService();
+    service.logger = mockLogger;
+    await expect(
+      service.promptSessionStreaming(testSessionId, 'test prompt').next()
+    ).rejects.toThrow();
 
-      expect(errorSpy).toHaveBeenCalledWith(
-        '❌ Query setup failed:',
-        expect.objectContaining({
-          category: 'setup_error',
-          message: 'Working directory for this session is unavailable.',
-        })
-      );
-    } finally {
-      errorSpy.mockRestore();
-    }
+    expect(mockLogger.error).toHaveBeenCalledWith(
+      '[executor:error] Query setup failed:',
+      expect.objectContaining({
+        category: 'setup_error',
+        message: 'Working directory for this session is unavailable.',
+      })
+    );
   });
 });

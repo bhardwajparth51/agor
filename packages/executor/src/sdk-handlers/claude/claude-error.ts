@@ -1,4 +1,4 @@
-import { MCPExternalError } from '@agor/core/mcp';
+import { MCP_EXTERNAL_CATEGORIES, MCPExternalError } from '@agor/core/mcp';
 import { MissingCredentialError } from '../../handlers/sdk/base-executor.js';
 
 export type ClaudeExecutionErrorCategory =
@@ -89,7 +89,8 @@ export function isClaudeAbortError(error: unknown): boolean {
 export function logClaudeFailure(
   label: string,
   safe: unknown,
-  extra?: Record<string, unknown>
+  extra?: Record<string, unknown>,
+  logger: { error: (...args: unknown[]) => void } = console
 ): void {
   const isClaude = isClaudeDiagnosticError(safe);
   const category =
@@ -102,7 +103,7 @@ export function logClaudeFailure(
   const message =
     safe instanceof Error ? safe.message : typeof safe === 'string' ? safe : undefined;
 
-  console.error(label, {
+  logger.error(label, {
     ...extra,
     category,
     message,
@@ -124,15 +125,12 @@ const NETWORK_ERROR_CODES = new Set([
   'UND_ERR_HEADERS_TIMEOUT',
 ]);
 
-const VALID_MCP_CATEGORIES = new Set([
-  'provider_unavailable',
-  'provider_rejected',
-  'invalid_response',
-  'storage_policy_rejected',
-  'configuration_required',
-  'unknown',
-]);
+const VALID_MCP_CATEGORIES = new Set<string>(MCP_EXTERNAL_CATEGORIES);
 
+// NOTE: HTTP_*_PATTERN rules below are fallbacks for providers that embed HTTP status
+// codes only in the error message string rather than in a structured `status` field.
+// When a numeric `status` field is present, the explicit status checks within the unified
+// rules match directly.
 const HTTP_401_PATTERN = /\b(?:http(?: status)?|status(?: code)?|api error)\s*:?\s*401\b/;
 const HTTP_403_PATTERN = /\b(?:http(?: status)?|status(?: code)?|api error)\s*:?\s*403\b/;
 const HTTP_429_PATTERN = /\b(?:http(?: status)?|status(?: code)?|api error)\s*:?\s*429\b/;
@@ -181,31 +179,139 @@ export const MESSAGES = {
 } as const;
 
 type ClassificationContext = {
-  msg: string;
   rawMessage: string;
+  msg: string;
   status?: number;
-  errorClass?: string;
   exitCode?: number;
   signal?: string;
+  errorClass?: string;
   code?: string;
+  cause: unknown;
 };
 
-type Rule = {
+function normalizeStatus(raw: unknown): number | undefined {
+  return typeof raw === 'number' && Number.isInteger(raw) && raw >= 100 && raw <= 599
+    ? raw
+    : typeof raw === 'string' && /^\d{3}$/.test(raw.trim())
+      ? Number(raw.trim())
+      : undefined;
+}
+
+function normalizeExitCode(raw: unknown): number | undefined {
+  return typeof raw === 'number' && Number.isInteger(raw) ? raw : undefined;
+}
+
+function extractRawErrorMessage(error: unknown, record: Record<string, unknown>): string {
+  if (error instanceof Error) return error.message || '';
+  if (typeof error === 'string') return error;
+  if (typeof record.message === 'string') return record.message;
+  return '';
+}
+
+function buildClassificationContext(error: unknown): ClassificationContext {
+  const record = error && typeof error === 'object' ? (error as Record<string, unknown>) : {};
+
+  const errorClass = typeof record.errorClass === 'string' ? record.errorClass : undefined;
+  const signal = typeof record.signal === 'string' ? record.signal : undefined;
+  const code = typeof record.code === 'string' ? record.code : undefined;
+
+  const rawStatus = record.status ?? record.statusCode;
+  const status = normalizeStatus(rawStatus);
+  const rawMessage = extractRawErrorMessage(error, record);
+
+  let exitCode = normalizeExitCode(record.exitCode);
+  if (exitCode === undefined) {
+    const match = rawMessage.match(EXIT_CODE_PATTERN);
+    if (match?.[1]) exitCode = Number(match[1]);
+  }
+
+  return {
+    rawMessage,
+    msg: rawMessage.toLowerCase(),
+    status,
+    exitCode,
+    signal,
+    errorClass,
+    code,
+    cause: error,
+  };
+}
+
+function isMCPDuckType(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const record = error as Record<string, unknown>;
+  return (
+    record.name === 'MCPExternalError' &&
+    typeof record.category === 'string' &&
+    VALID_MCP_CATEGORIES.has(record.category) &&
+    record.diagnostic !== null &&
+    typeof record.diagnostic === 'object' &&
+    typeof (record.diagnostic as Record<string, unknown>).stage === 'string' &&
+    typeof record.message === 'string'
+  );
+}
+
+type UnifiedRule = {
+  label: string;
   test: (ctx: ClassificationContext) => boolean;
   category: ClaudeExecutionErrorCategory;
   message: string | ((ctx: ClassificationContext) => string);
+  isMissingCredential?: true;
 };
 
-// Priority order: authentication rejections (401, 403, bad keys, IAM) MUST evaluate before
-// missing credentials so expired or invalid keys never trigger misleading login recovery prompts.
-const MESSAGE_RULES: Rule[] = [
+const CLASSIFICATION_RULES: UnifiedRule[] = [
+  // SDK startup failures
   {
-    test: (c) => c.msg.includes('403 forbidden') || HTTP_403_PATTERN.test(c.msg),
+    label: 'sdk:executable_not_found',
+    test: (c) => c.errorClass === 'executable_not_found',
+    category: 'process_failure',
+    message: MESSAGES.executableNotFound,
+  },
+  {
+    label: 'sdk:executable_launch_failed',
+    test: (c) => c.errorClass === 'executable_launch_failed',
+    category: 'process_failure',
+    message: MESSAGES.executableLaunchFailed,
+  },
+  {
+    label: 'sdk:spawn_failed',
+    test: (c) => c.errorClass === 'spawn_failed' || c.errorClass === 'process_error',
+    category: 'process_failure',
+    message: MESSAGES.spawnFailed,
+  },
+  {
+    label: 'sdk:initialize_timeout',
+    test: (c) => c.errorClass === 'initialize_timeout',
+    category: 'process_failure',
+    message: MESSAGES.initializeTimeout,
+  },
+  // Process signals
+  {
+    label: 'sdk:process_killed_by_signal',
+    test: (c) => c.errorClass === 'process_killed_by_signal' || Boolean(c.signal),
+    category: 'process_failure',
+    message: (c) => MESSAGES.processSignal(c.signal),
+  },
+  // Structured node network codes
+  {
+    label: 'network:error_code',
+    test: (c) => Boolean(c.code && NETWORK_ERROR_CODES.has(c.code)),
+    category: 'network',
+    message: MESSAGES.network,
+  },
+  // HTTP 403 Forbidden
+  {
+    label: 'http:403',
+    test: (c) =>
+      c.status === 403 || c.msg.includes('403 forbidden') || HTTP_403_PATTERN.test(c.msg),
     category: 'authentication',
     message: MESSAGES.forbidden,
   },
+  // HTTP 401 & invalid API keys (evaluated before missing_credential)
   {
+    label: 'http:401_or_bad_key',
     test: (c) =>
+      c.status === 401 ||
       c.msg.includes('invalid api key') ||
       c.msg.includes('invalid_api_key') ||
       c.msg.includes('api key not valid') ||
@@ -216,15 +322,20 @@ const MESSAGE_RULES: Rule[] = [
     category: 'authentication',
     message: MESSAGES.authentication,
   },
+  // Missing credentials (unauthenticated session)
   {
+    label: 'auth:missing_credential',
     test: (c) =>
       c.msg.includes('not logged in') ||
       c.msg.includes('please run /login') ||
       c.msg.includes('authentication is not configured'),
     category: 'missing_credential',
     message: MESSAGES.missingCredential,
+    isMissingCredential: true,
   },
+  // Billing & credit limits
   {
+    label: 'billing:credit_exhausted',
     test: (c) =>
       c.msg.includes('credit balance') ||
       c.msg.includes('insufficient_quota') ||
@@ -233,24 +344,36 @@ const MESSAGE_RULES: Rule[] = [
     category: 'credit_exhausted',
     message: MESSAGES.creditExhausted,
   },
+  // Rate limiting (HTTP 429 & message patterns)
   {
+    label: 'http:429_or_rate_limit',
     test: (c) =>
+      c.status === 429 ||
       c.msg.includes('rate limit') ||
       c.msg.includes('too many requests') ||
       HTTP_429_PATTERN.test(c.msg),
     category: 'rate_limit',
     message: MESSAGES.rateLimit,
   },
+  // Temporary server unavailability (HTTP 500 & 502)
   {
+    label: 'http:500_502_or_unavailable',
     test: (c) =>
+      c.status === 500 ||
+      c.status === 502 ||
       c.msg.includes('500 internal server error') ||
       c.msg.includes('502 bad gateway') ||
       HTTP_500_502_PATTERN.test(c.msg),
     category: 'overloaded',
     message: MESSAGES.unavailable,
   },
+  // Upstream overload & gateway timeouts (HTTP 503, 504, 529)
   {
+    label: 'http:503_504_529_or_overloaded',
     test: (c) =>
+      c.status === 503 ||
+      c.status === 504 ||
+      c.status === 529 ||
       c.msg.includes('overloaded') ||
       c.msg.includes('service unavailable') ||
       c.msg.includes('gateway timeout') ||
@@ -258,22 +381,28 @@ const MESSAGE_RULES: Rule[] = [
     category: 'overloaded',
     message: MESSAGES.overloaded,
   },
+  // Agentic execution limits
   {
+    label: 'limit:turn',
     test: (c) => c.msg.includes('error_max_turns') || c.msg.includes('turn limit'),
     category: 'turn_limit',
     message: MESSAGES.turnLimit,
   },
   {
+    label: 'limit:budget',
     test: (c) => c.msg.includes('error_max_budget_usd') || c.msg.includes('budget limit'),
     category: 'budget_limit',
     message: MESSAGES.budgetLimit,
   },
   {
+    label: 'limit:structured_output',
     test: (c) => c.msg.includes('error_max_structured_output_retries'),
     category: 'structured_output_limit',
     message: MESSAGES.structuredOutputLimit,
   },
+  // Network connection failures (string fallbacks)
   {
+    label: 'network:string_fallback',
     test: (c) =>
       c.msg.includes('fetch failed') ||
       c.msg.includes('network error') ||
@@ -285,7 +414,9 @@ const MESSAGE_RULES: Rule[] = [
     category: 'network',
     message: MESSAGES.network,
   },
+  // Unexpected process termination
   {
+    label: 'process:nonzero_exit',
     test: (c) =>
       c.errorClass === 'process_exited_nonzero' ||
       (c.exitCode !== undefined && c.exitCode !== 0) ||
@@ -295,128 +426,46 @@ const MESSAGE_RULES: Rule[] = [
   },
 ];
 
+/**
+ * Classifies a raw Claude SDK error into a typed, user-safe error instance.
+ *
+ * The returned error's `.message` is always sanitized and safe for display.
+ * The original error is retained as `.cause` for server-side diagnostics.
+ *
+ * @security Never serialize or forward `.cause.message` to clients.
+ * It may contain raw provider payloads including API keys, auth tokens, or
+ * filesystem paths from the original error.
+ */
 export function sanitizeClaudeExecutionError(
   error: unknown
 ): ClaudeExecutionError | ClaudeMissingCredentialError | MCPExternalError | AgorSetupError {
+  // Pass-through guards for already typed instances
   if (error instanceof MCPExternalError) return error;
-
-  const record = error && typeof error === 'object' ? (error as Record<string, unknown>) : {};
-  if (
-    record.name === 'MCPExternalError' &&
-    typeof record.category === 'string' &&
-    VALID_MCP_CATEGORIES.has(record.category) &&
-    record.diagnostic &&
-    typeof record.diagnostic === 'object'
-  ) {
-    return error as MCPExternalError;
-  }
-
+  if (isMCPDuckType(error)) return error as MCPExternalError;
   if (error instanceof ClaudeExecutionError || error instanceof ClaudeMissingCredentialError) {
     return error;
   }
   if (isAgorSetupError(error)) return error;
 
-  const errorClass = typeof record.errorClass === 'string' ? record.errorClass : undefined;
-  const signal = typeof record.signal === 'string' ? record.signal : undefined;
-  const code = typeof record.code === 'string' ? record.code : undefined;
-
-  const rawStatus = record.status ?? record.statusCode;
-  const status =
-    typeof rawStatus === 'number' &&
-    Number.isInteger(rawStatus) &&
-    rawStatus >= 100 &&
-    rawStatus <= 599
-      ? rawStatus
-      : typeof rawStatus === 'string' && /^\d{3}$/.test(rawStatus.trim())
-        ? Number(rawStatus.trim())
-        : undefined;
-
-  let exitCode =
-    typeof record.exitCode === 'number' && Number.isInteger(record.exitCode)
-      ? record.exitCode
-      : typeof record.exitCode === 'string' && /^\d{1,3}$/.test(record.exitCode.trim())
-        ? Number(record.exitCode.trim())
-        : undefined;
-
-  const rawMessage =
-    error instanceof Error
-      ? error.message || ''
-      : typeof error === 'string'
-        ? error
-        : typeof record.message === 'string'
-          ? record.message
-          : '';
-
-  if (exitCode === undefined) {
-    const match = rawMessage.match(EXIT_CODE_PATTERN);
-    if (match?.[1]) exitCode = Number(match[1]);
-  }
-
-  const diag = { cause: error, exitCode, signal, errorClass, code };
-
   if (error instanceof MissingCredentialError) {
-    return new ClaudeMissingCredentialError(error.message || MESSAGES.missingCredential, diag);
+    return new ClaudeMissingCredentialError(error.message || MESSAGES.missingCredential, {
+      cause: error,
+    });
   }
 
-  // Explicit SDK startup errorClass values take precedence over message inspection
-  if (errorClass === 'executable_not_found') {
-    return new ClaudeExecutionError('process_failure', MESSAGES.executableNotFound, diag);
-  }
-  if (errorClass === 'executable_launch_failed') {
-    return new ClaudeExecutionError('process_failure', MESSAGES.executableLaunchFailed, diag);
-  }
-  if (errorClass === 'spawn_failed' || errorClass === 'process_error') {
-    return new ClaudeExecutionError('process_failure', MESSAGES.spawnFailed, diag);
-  }
-  if (errorClass === 'initialize_timeout') {
-    return new ClaudeExecutionError('process_failure', MESSAGES.initializeTimeout, diag);
-  }
-  if (errorClass === 'process_killed_by_signal' || signal) {
-    return new ClaudeExecutionError('process_failure', MESSAGES.processSignal(signal), diag);
-  }
-
-  if (code && NETWORK_ERROR_CODES.has(code)) {
-    return new ClaudeExecutionError('network', MESSAGES.network, diag);
-  }
-
-  const msg = rawMessage.toLowerCase();
-
-  // Authoritative numeric status codes from API client/provider
-  if (status === 403) {
-    return new ClaudeExecutionError('authentication', MESSAGES.forbidden, diag);
-  }
-  if (status === 401) {
-    return new ClaudeExecutionError('authentication', MESSAGES.authentication, diag);
-  }
-  if (status === 429) {
-    const isCredit = msg.includes('credit balance') || msg.includes('insufficient_quota');
-    return new ClaudeExecutionError(
-      isCredit ? 'credit_exhausted' : 'rate_limit',
-      isCredit ? MESSAGES.creditExhausted : MESSAGES.rateLimit,
-      diag
-    );
-  }
-  if (status === 500 || status === 502) {
-    return new ClaudeExecutionError('overloaded', MESSAGES.unavailable, diag);
-  }
-  if (status === 503 || status === 504 || status === 529) {
-    return new ClaudeExecutionError('overloaded', MESSAGES.overloaded, diag);
-  }
-
-  const ctx: ClassificationContext = {
-    msg,
-    rawMessage,
-    status,
-    errorClass,
-    exitCode,
-    signal,
-    code,
+  const ctx = buildClassificationContext(error);
+  const diag = {
+    cause: error,
+    exitCode: ctx.exitCode,
+    signal: ctx.signal,
+    errorClass: ctx.errorClass,
+    code: ctx.code,
   };
 
-  for (const rule of MESSAGE_RULES) {
+  for (const rule of CLASSIFICATION_RULES) {
     if (rule.test(ctx)) {
       const text = typeof rule.message === 'function' ? rule.message(ctx) : rule.message;
-      return rule.category === 'missing_credential'
+      return rule.isMissingCredential
         ? new ClaudeMissingCredentialError(text, diag)
         : new ClaudeExecutionError(rule.category, text, diag);
     }
