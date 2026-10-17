@@ -237,6 +237,23 @@ describe('Claude failure diagnosis', () => {
     expect(JSON.stringify(error)).not.toContain('SECRET');
   });
 
+  it.each(['ENOENT', 'EACCES', 'EPERM', 'ENOEXEC', 'EAGAIN', 'EMFILE', 'ENOMEM'])(
+    'diagnoses bare process code %s without guessing which resource failed',
+    (code) => {
+      for (const text of [`spawn claude ${code} SECRET`, 'Invalid API key SECRET']) {
+        const error = sanitizeClaudeExecutionError(Object.assign(new Error(text), { code }));
+        expect(error).toMatchObject({
+          category: 'process_failure',
+          code,
+          message: MESSAGES.processFailure,
+        });
+        expect(error.message).not.toContain('executable');
+        expect(error.message).not.toContain('SECRET');
+        expect(error).not.toBeInstanceOf(MissingCredentialError);
+      }
+    }
+  );
+
   it('recognizes network codes without exposing endpoint text', () => {
     expect(
       sanitizeClaudeExecutionError(

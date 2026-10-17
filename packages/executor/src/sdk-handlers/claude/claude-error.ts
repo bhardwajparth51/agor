@@ -174,6 +174,8 @@ export const MESSAGES = {
   executableLaunchFailed:
     'Claude Code executable failed to launch. Verify system runtime compatibility and permissions.',
   spawnFailed: 'Failed to spawn Claude Code process. Verify your environment and permissions.',
+  processFailure:
+    'Claude Code encountered a system error. Check the runtime environment and permissions; review any output and tool activity before retrying.',
   processSignal: (signal?: string) =>
     signal
       ? `Claude Code process was terminated by signal ${signal}.`
@@ -311,6 +313,10 @@ export function sanitizeClaudeExecutionError(error: unknown): Error {
   const fromStatus = httpFailure(own(error, 'status') ?? own(error, 'statusCode'), diag);
   if (fromStatus) return fromStatus;
   if (diag.code && NETWORK_CODES.has(diag.code)) return failure('network', MESSAGES.network, diag);
+  // Native errors may omit errorClass. ENOENT can refer to a cwd or other file,
+  // so a bare code does not establish that the Claude executable is missing.
+  if (diag.code && PROCESS_CODES.has(diag.code))
+    return failure('process_failure', MESSAGES.processFailure, diag);
   const message = typeof error === 'string' ? error : own(error, 'message');
   // Older CLI versions lack structured process diagnostics. Restrict fallback to
   // their prefix, not numbers or credentials embedded in stderr.
