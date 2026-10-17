@@ -1,11 +1,18 @@
-import { MCP_EXTERNAL_CATEGORIES, MCPExternalError } from '@agor/core/mcp';
-import { MissingCredentialError } from '../../handlers/sdk/base-executor.js';
+import { constants } from 'node:os';
+import { projectClaudeResultResponse, SAFE_ZERO_TURN_PROVIDER_RESULT_MESSAGE } from '@agor/core';
+import {
+  asMCPExternalError,
+  isMCPAbortError,
+  MCPExternalError,
+  type MCPExternalErrorCategory,
+} from '@agor/core/mcp';
 
+/** Diagnostic hints only: none of these categories grants credential recovery or retry authority. */
 export type ClaudeExecutionErrorCategory =
   | 'authentication'
-  | 'missing_credential'
   | 'credit_exhausted'
   | 'rate_limit'
+  | 'quota'
   | 'overloaded'
   | 'turn_limit'
   | 'budget_limit'
@@ -20,6 +27,73 @@ interface DiagnosticOptions {
   signal?: string;
   errorClass?: string;
   code?: string;
+}
+
+const NETWORK_CODES = new Set([
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'ENOTFOUND',
+  'ETIMEDOUT',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_HEADERS_TIMEOUT',
+]);
+const PROCESS_CODES = new Set([
+  'ENOENT',
+  'EACCES',
+  'EPERM',
+  'ENOEXEC',
+  'EAGAIN',
+  'EMFILE',
+  'ENOMEM',
+]);
+const ERROR_CLASSES = new Set([
+  'error_result',
+  'executable_not_found',
+  'executable_launch_failed',
+  'spawn_failed',
+  'process_error',
+  'initialize_timeout',
+  'process_killed_by_signal',
+  'process_exited_nonzero',
+  'error_during_execution',
+  'error_max_turns',
+  'error_max_budget_usd',
+  'error_max_structured_output_retries',
+]);
+const SIGNALS = new Set(Object.keys(constants.signals));
+
+/** Own data only: provider exceptions can have getters, proxies and custom coercion hooks. */
+function own(value: unknown, key: string): unknown {
+  if (!value || typeof value !== 'object') return undefined;
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor && 'value' in descriptor ? descriptor.value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function instanceOf<T extends Error>(
+  value: unknown,
+  type: new (...args: never[]) => T
+): value is T {
+  try {
+    return value instanceof type;
+  } catch {
+    return false;
+  }
+}
+
+function allowed(value: unknown, values: ReadonlySet<string>): string | undefined {
+  return typeof value === 'string' && values.has(value) ? value : undefined;
+}
+
+function exitCode(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 255
+    ? value
+    : undefined;
 }
 
 export class ClaudeExecutionError extends Error {
@@ -37,125 +111,59 @@ export class ClaudeExecutionError extends Error {
     super(message, options?.cause ? { cause: options.cause } : undefined);
     this.name = 'ClaudeExecutionError';
     this.category = category;
-    this.exitCode = options?.exitCode;
-    this.signal = options?.signal;
-    this.errorClass = options?.errorClass;
-    this.code = options?.code;
+    this.exitCode = exitCode(options?.exitCode);
+    this.signal = allowed(options?.signal, SIGNALS);
+    this.errorClass = allowed(options?.errorClass, ERROR_CLASSES);
+    this.code = allowed(options?.code, NETWORK_CODES) ?? allowed(options?.code, PROCESS_CODES);
   }
 }
 
-export class ClaudeMissingCredentialError extends MissingCredentialError {
-  readonly category = 'missing_credential' as const;
-  override readonly name = 'MissingCredentialError';
-  readonly exitCode?: number;
-  readonly signal?: string;
-  readonly errorClass?: string;
-  readonly code?: string;
-
-  constructor(message: string, options?: DiagnosticOptions) {
-    super(message, options?.cause ? { cause: options.cause } : undefined);
-    this.exitCode = options?.exitCode;
-    this.signal = options?.signal;
-    this.errorClass = options?.errorClass;
-    this.code = options?.code;
-  }
-}
-
-export type ClaudeDiagnosticError = ClaudeExecutionError | ClaudeMissingCredentialError;
-
-export function isClaudeDiagnosticError(error: unknown): error is ClaudeDiagnosticError {
-  return error instanceof ClaudeExecutionError || error instanceof ClaudeMissingCredentialError;
-}
-
+/** Locally authored setup guidance, not a provider classification. */
 export class AgorSetupError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'AgorSetupError';
-  }
-}
-
-export function isAgorSetupError(error: unknown): error is AgorSetupError {
-  return error instanceof AgorSetupError;
+  override readonly name = 'AgorSetupError';
 }
 
 export function isClaudeAbortError(error: unknown): boolean {
-  return Boolean(
-    error &&
-      typeof error === 'object' &&
-      (error as { errorClass?: unknown }).errorClass === 'aborted'
-  );
+  return isMCPAbortError(error) || own(error, 'errorClass') === 'aborted';
 }
 
 export function logClaudeFailure(
   label: string,
-  safe: unknown,
-  extra?: Record<string, unknown>,
+  error: unknown,
+  extra?: { sessionId?: string; taskId?: string; messageCount?: number; hasStderr?: boolean },
   logger: { error: (...args: unknown[]) => void } = console
 ): void {
-  const isClaude = isClaudeDiagnosticError(safe);
-  const category =
-    safe && typeof safe === 'object' && 'category' in safe
-      ? (safe as { category: unknown }).category
-      : isAgorSetupError(safe)
-        ? 'setup_error'
-        : undefined;
-
-  const message =
-    safe instanceof Error ? safe.message : typeof safe === 'string' ? safe : undefined;
-
-  logger.error(label, {
-    ...extra,
-    category,
-    message,
-    errorClass: isClaude ? safe.errorClass : undefined,
-    exitCode: isClaude ? safe.exitCode : undefined,
-    signal: isClaude ? safe.signal : undefined,
-    code: isClaude ? safe.code : undefined,
-  });
+  // Do not log arbitrary exception messages, even for local persistence/setup failures.
+  // Category and closed diagnostic fields are sufficient; cause is never serialized.
+  if (instanceOf(error, ClaudeExecutionError)) {
+    logger.error(label, {
+      ...extra,
+      category: error.category,
+      errorClass: error.errorClass,
+      exitCode: error.exitCode,
+      signal: error.signal,
+      code: error.code,
+    });
+  } else if (instanceOf(error, MCPExternalError)) {
+    const safe = asMCPExternalError(error, { stage: 'runtime' });
+    logger.error(label, { ...extra, category: safe.category, ...safe.diagnostic });
+  } else {
+    logger.error(label, {
+      ...extra,
+      category: instanceOf(error, AgorSetupError) ? 'setup_error' : 'agor_processing',
+    });
+  }
 }
-
-const NETWORK_ERROR_CODES = new Set([
-  'ECONNREFUSED',
-  'ECONNRESET',
-  'EHOSTUNREACH',
-  'ENETUNREACH',
-  'ENOTFOUND',
-  'ETIMEDOUT',
-  'UND_ERR_CONNECT_TIMEOUT',
-  'UND_ERR_HEADERS_TIMEOUT',
-]);
-
-const VALID_MCP_CATEGORIES = new Set<string>(MCP_EXTERNAL_CATEGORIES);
-
-// NOTE: HTTP_*_PATTERN rules below are fallbacks for providers that embed HTTP status
-// codes only in the error message string rather than in a structured `status` field.
-// When a numeric `status` field is present, the explicit status checks within the unified
-// rules match directly.
-const HTTP_401_PATTERN = /\b(?:http(?: status)?|status(?: code)?|api error)\s*:?\s*401\b/;
-const HTTP_403_PATTERN = /\b(?:http(?: status)?|status(?: code)?|api error)\s*:?\s*403\b/;
-const HTTP_429_PATTERN = /\b(?:http(?: status)?|status(?: code)?|api error)\s*:?\s*429\b/;
-const HTTP_500_502_PATTERN =
-  /\b(?:http(?: status)?|status(?: code)?|api error)\s*:?\s*(?:500|502)\b/;
-const HTTP_503_504_529_PATTERN =
-  /\b(?:http(?: status)?|status(?: code)?|api error)\s*:?\s*(?:503|504|529)\b/;
-const CLOUD_IAM_AUTH_PATTERN =
-  /accessdenied|unrecognizedclient|expiredtoken|credentialsprovidererror|could not load credentials|authfailure/;
-const EXIT_CODE_PATTERN = /exited with (?:non-zero )?code (\d{1,3})/i;
-const NON_ZERO_EXIT_PATTERN = /\bprocess exited with (?:non-zero )?code (?!0\b)\d+/i;
 
 export const MESSAGES = {
   authentication:
-    'Claude Code authentication failed. Check your API key or provider credentials in Settings → Claude Code authentication.',
-  forbidden:
-    'Claude Code authentication failed (HTTP 403). Check your API key or provider credentials in Settings → Claude Code authentication, or that your account has access.',
-  missingCredential:
-    'Claude Code authentication is not configured. Please sign in or provide an API key.',
+    'Claude Code could not authenticate. Check your Claude Code provider credentials and account access.',
   creditExhausted:
-    'Claude Code credit balance is too low. Please top up your Anthropic account credits.',
+    'Claude Code reported insufficient provider credit. Check billing with your configured provider.',
   rateLimit: 'Claude Code rate limit reached. Please wait before retrying your request.',
-  overloaded:
-    'Claude Code is currently overloaded or temporarily unavailable. Please retry shortly.',
-  unavailable: 'Claude Code is temporarily unavailable. Please retry shortly.',
+  quota:
+    'Claude Code provider quota was exceeded. Check the quota limits with your configured provider.',
+  overloaded: 'Claude Code is temporarily unavailable. Please retry shortly.',
   turnLimit: 'Claude Code reached the maximum turn limit for this task.',
   budgetLimit: 'Claude Code reached the maximum budget limit for this task.',
   structuredOutputLimit: 'Claude Code reached the retry limit for structured output.',
@@ -170,306 +178,173 @@ export const MESSAGES = {
     signal
       ? `Claude Code process was terminated by signal ${signal}.`
       : 'Claude Code process was terminated by a signal.',
-  processExit: (exitCode?: number) =>
-    exitCode
-      ? `Claude Code process exited unexpectedly (code ${exitCode}). Retry your request, or check the logs if the issue persists.`
-      : 'Claude Code process exited unexpectedly. Retry your request, or check the logs if the issue persists.',
+  processExit: (code?: number) =>
+    code !== undefined
+      ? `Claude Code process exited unexpectedly (code ${code}). Review any output and tool activity before retrying.`
+      : 'Claude Code process exited unexpectedly. Review any output and tool activity before retrying.',
   unknown:
-    'Claude Code execution failed. Retry your request, or check the operational logs if the issue persists.',
+    'Claude Code execution failed. Review any output and tool activity before retrying; contact your administrator if it continues.',
 } as const;
 
-type ClassificationContext = {
-  rawMessage: string;
-  msg: string;
-  status?: number;
-  exitCode?: number;
-  signal?: string;
-  errorClass?: string;
-  code?: string;
-  cause: unknown;
-};
-
-function normalizeStatus(raw: unknown): number | undefined {
-  return typeof raw === 'number' && Number.isInteger(raw) && raw >= 100 && raw <= 599
-    ? raw
-    : typeof raw === 'string' && /^\d{3}$/.test(raw.trim())
-      ? Number(raw.trim())
-      : undefined;
+function failure(
+  category: ClaudeExecutionErrorCategory,
+  message: string,
+  diag?: DiagnosticOptions
+) {
+  return new ClaudeExecutionError(category, message, diag);
 }
 
-function normalizeExitCode(raw: unknown): number | undefined {
-  return typeof raw === 'number' && Number.isInteger(raw) ? raw : undefined;
-}
-
-function extractRawErrorMessage(error: unknown, record: Record<string, unknown>): string {
-  if (error instanceof Error) return error.message || '';
-  if (typeof error === 'string') return error;
-  if (typeof record.message === 'string') return record.message;
-  return '';
-}
-
-function buildClassificationContext(error: unknown): ClassificationContext {
-  const record = error && typeof error === 'object' ? (error as Record<string, unknown>) : {};
-
-  const errorClass = typeof record.errorClass === 'string' ? record.errorClass : undefined;
-  const signal = typeof record.signal === 'string' ? record.signal : undefined;
-  const code = typeof record.code === 'string' ? record.code : undefined;
-
-  const rawStatus = record.status ?? record.statusCode;
-  const status = normalizeStatus(rawStatus);
-  const rawMessage = extractRawErrorMessage(error, record);
-
-  let exitCode = normalizeExitCode(record.exitCode);
-  if (exitCode === undefined) {
-    const match = rawMessage.match(EXIT_CODE_PATTERN);
-    if (match?.[1]) exitCode = Number(match[1]);
+function httpFailure(status: unknown, diag?: DiagnosticOptions): ClaudeExecutionError | undefined {
+  switch (status) {
+    case 401:
+    case 403:
+      return failure('authentication', MESSAGES.authentication, diag);
+    case 429:
+      return failure('rate_limit', MESSAGES.rateLimit, diag);
+    case 500:
+    case 502:
+    case 503:
+    case 504:
+    case 529:
+      return failure('overloaded', MESSAGES.overloaded, diag);
+    default:
+      return undefined;
   }
-
-  return {
-    rawMessage,
-    msg: rawMessage.toLowerCase(),
-    status,
-    exitCode,
-    signal,
-    errorClass,
-    code,
-    cause: error,
-  };
 }
 
-function isMCPDuckType(error: unknown): boolean {
-  if (!error || typeof error !== 'object') return false;
-  const record = error as Record<string, unknown>;
-  return (
-    record.name === 'MCPExternalError' &&
-    typeof record.category === 'string' &&
-    VALID_MCP_CATEGORIES.has(record.category) &&
-    record.diagnostic !== null &&
-    typeof record.diagnostic === 'object' &&
-    typeof (record.diagnostic as Record<string, unknown>).stage === 'string' &&
-    typeof record.message === 'string'
-  );
+function limitFailure(
+  subtype: unknown,
+  diag?: DiagnosticOptions
+): ClaudeExecutionError | undefined {
+  switch (subtype) {
+    case 'error_max_turns':
+      return failure('turn_limit', MESSAGES.turnLimit, diag);
+    case 'error_max_budget_usd':
+      return failure('budget_limit', MESSAGES.budgetLimit, diag);
+    case 'error_max_structured_output_retries':
+      return failure('structured_output_limit', MESSAGES.structuredOutputLimit, diag);
+    default:
+      return undefined;
+  }
 }
 
-type UnifiedRule = {
-  label: string;
-  test: (ctx: ClassificationContext) => boolean;
-  category: ClaudeExecutionErrorCategory;
-  message: string | ((ctx: ClassificationContext) => string);
-  isMissingCredential?: true;
-};
-
-const CLASSIFICATION_RULES: UnifiedRule[] = [
-  // SDK startup failures
-  {
-    label: 'sdk:executable_not_found',
-    test: (c) => c.errorClass === 'executable_not_found',
-    category: 'process_failure',
-    message: MESSAGES.executableNotFound,
-  },
-  {
-    label: 'sdk:executable_launch_failed',
-    test: (c) => c.errorClass === 'executable_launch_failed',
-    category: 'process_failure',
-    message: MESSAGES.executableLaunchFailed,
-  },
-  {
-    label: 'sdk:spawn_failed',
-    test: (c) => c.errorClass === 'spawn_failed' || c.errorClass === 'process_error',
-    category: 'process_failure',
-    message: MESSAGES.spawnFailed,
-  },
-  {
-    label: 'sdk:initialize_timeout',
-    test: (c) => c.errorClass === 'initialize_timeout',
-    category: 'process_failure',
-    message: MESSAGES.initializeTimeout,
-  },
-  // Process signals
-  {
-    label: 'sdk:process_killed_by_signal',
-    test: (c) => c.errorClass === 'process_killed_by_signal' || Boolean(c.signal),
-    category: 'process_failure',
-    message: (c) => MESSAGES.processSignal(c.signal),
-  },
-  // Structured node network codes
-  {
-    label: 'network:error_code',
-    test: (c) => Boolean(c.code && NETWORK_ERROR_CODES.has(c.code)),
-    category: 'network',
-    message: MESSAGES.network,
-  },
-  // HTTP 403 Forbidden
-  {
-    label: 'http:403',
-    test: (c) =>
-      c.status === 403 || c.msg.includes('403 forbidden') || HTTP_403_PATTERN.test(c.msg),
-    category: 'authentication',
-    message: MESSAGES.forbidden,
-  },
-  // HTTP 401 & invalid API keys (evaluated before missing_credential)
-  {
-    label: 'http:401_or_bad_key',
-    test: (c) =>
-      c.status === 401 ||
-      c.msg.includes('invalid api key') ||
-      c.msg.includes('invalid_api_key') ||
-      c.msg.includes('api key not valid') ||
-      c.msg.includes('fix external api key') ||
-      c.msg.includes('401 unauthorized') ||
-      HTTP_401_PATTERN.test(c.msg) ||
-      CLOUD_IAM_AUTH_PATTERN.test(c.msg),
-    category: 'authentication',
-    message: MESSAGES.authentication,
-  },
-  // Missing credentials (unauthenticated session)
-  {
-    label: 'auth:missing_credential',
-    test: (c) =>
-      c.msg.includes('not logged in') ||
-      c.msg.includes('please run /login') ||
-      c.msg.includes('authentication is not configured'),
-    category: 'missing_credential',
-    message: MESSAGES.missingCredential,
-    isMissingCredential: true,
-  },
-  // Billing & credit limits
-  {
-    label: 'billing:credit_exhausted',
-    test: (c) =>
-      c.msg.includes('credit balance') ||
-      c.msg.includes('insufficient_quota') ||
-      c.msg.includes('balance is exhausted') ||
-      c.msg.includes('balance exhausted'),
-    category: 'credit_exhausted',
-    message: MESSAGES.creditExhausted,
-  },
-  // Rate limiting (HTTP 429 & message patterns)
-  {
-    label: 'http:429_or_rate_limit',
-    test: (c) =>
-      c.status === 429 ||
-      c.msg.includes('rate limit') ||
-      c.msg.includes('too many requests') ||
-      HTTP_429_PATTERN.test(c.msg),
-    category: 'rate_limit',
-    message: MESSAGES.rateLimit,
-  },
-  // Temporary server unavailability (HTTP 500 & 502)
-  {
-    label: 'http:500_502_or_unavailable',
-    test: (c) =>
-      c.status === 500 ||
-      c.status === 502 ||
-      c.msg.includes('500 internal server error') ||
-      c.msg.includes('502 bad gateway') ||
-      HTTP_500_502_PATTERN.test(c.msg),
-    category: 'overloaded',
-    message: MESSAGES.unavailable,
-  },
-  // Upstream overload & gateway timeouts (HTTP 503, 504, 529)
-  {
-    label: 'http:503_504_529_or_overloaded',
-    test: (c) =>
-      c.status === 503 ||
-      c.status === 504 ||
-      c.status === 529 ||
-      c.msg.includes('overloaded') ||
-      c.msg.includes('service unavailable') ||
-      c.msg.includes('gateway timeout') ||
-      HTTP_503_504_529_PATTERN.test(c.msg),
-    category: 'overloaded',
-    message: MESSAGES.overloaded,
-  },
-  // Agentic execution limits
-  {
-    label: 'limit:turn',
-    test: (c) => c.msg.includes('error_max_turns') || c.msg.includes('turn limit'),
-    category: 'turn_limit',
-    message: MESSAGES.turnLimit,
-  },
-  {
-    label: 'limit:budget',
-    test: (c) => c.msg.includes('error_max_budget_usd') || c.msg.includes('budget limit'),
-    category: 'budget_limit',
-    message: MESSAGES.budgetLimit,
-  },
-  {
-    label: 'limit:structured_output',
-    test: (c) => c.msg.includes('error_max_structured_output_retries'),
-    category: 'structured_output_limit',
-    message: MESSAGES.structuredOutputLimit,
-  },
-  // Network connection failures (string fallbacks)
-  {
-    label: 'network:string_fallback',
-    test: (c) =>
-      c.msg.includes('fetch failed') ||
-      c.msg.includes('network error') ||
-      c.msg.includes('connection refused') ||
-      c.msg.includes('connection reset') ||
-      c.msg.includes('socket hang up') ||
-      c.msg.includes('timed out') ||
-      c.msg.includes('timeout'),
-    category: 'network',
-    message: MESSAGES.network,
-  },
-  // Unexpected process termination
-  {
-    label: 'process:nonzero_exit',
-    test: (c) =>
-      c.errorClass === 'process_exited_nonzero' ||
-      (c.exitCode !== undefined && c.exitCode !== 0) ||
-      NON_ZERO_EXIT_PATTERN.test(c.rawMessage),
-    category: 'process_failure',
-    message: (c) => MESSAGES.processExit(c.exitCode),
-  },
-];
+/** Bounded diagnostic inference, never credential authority or a raw-text display surface. */
+function textFailure(text: unknown, diag?: DiagnosticOptions): ClaudeExecutionError | undefined {
+  if (typeof text !== 'string') return undefined;
+  // CLI exceptions sometimes carry a result prefix; never parse process stderr here.
+  const message = text.slice(0, 4096).replace(/^Claude Code returned an error result:\s*/i, '');
+  const http = message.match(/^(?:API Error:|HTTP(?: status)?|status(?: code)?)\s*(\d{3})\b/i);
+  const fromStatus = httpFailure(http ? Number(http[1]) : undefined, diag);
+  if (fromStatus) return fromStatus;
+  if (
+    /^(?:Invalid API key|invalid_api_key|API key not valid|Not logged in|Please run \/login|Authentication (?:failed|is not configured)|Unauthorized|AccessDenied(?:Exception)?|UnrecognizedClient(?:Exception)?|ExpiredToken(?:Exception)?|CredentialsProviderError|Could not load credentials|AuthFailure|OAuth token (?:has )?expired)\b/i.test(
+      message
+    )
+  ) {
+    return failure('authentication', MESSAGES.authentication, diag);
+  }
+  if (
+    /^(?:Credit balance (?:is )?too low|Insufficient credit|Balance (?:is )?exhausted)\b/i.test(
+      message
+    )
+  ) {
+    return failure('credit_exhausted', MESSAGES.creditExhausted, diag);
+  }
+  if (/^(?:Rate limit|Too many requests)\b/i.test(message))
+    return failure('rate_limit', MESSAGES.rateLimit, diag);
+  if (/^(?:Quota exceeded|insufficient_quota|ResourceExhausted)\b/i.test(message))
+    return failure('quota', MESSAGES.quota, diag);
+  if (/^(?:Overloaded|Service unavailable|Gateway timeout)\b/i.test(message))
+    return failure('overloaded', MESSAGES.overloaded, diag);
+  if (
+    /^(?:fetch failed|network error|connection refused|connection reset|socket hang up)\b/i.test(
+      message
+    )
+  )
+    return failure('network', MESSAGES.network, diag);
+  return limitFailure(message.split(':', 1)[0], diag);
+}
 
 /**
- * Classifies a raw Claude SDK error into a typed, user-safe error instance.
- *
- * The returned error's `.message` is always sanitized and safe for display.
- * The original error is retained as `.cause` for server-side diagnostics.
- *
- * @security Never serialize or forward `.cause.message` to clients.
- * It may contain raw provider payloads including API keys, auth tokens, or
- * filesystem paths from the original error.
+ * Call ONLY at Claude SDK call/iterator boundaries. Never apply this to the
+ * encompassing Agor setup, persistence, callbacks or permission handling loop.
+ * Abort identity and genuine MCP failures retain their existing lifecycle owners.
  */
-export function sanitizeClaudeExecutionError(
-  error: unknown
-): ClaudeExecutionError | ClaudeMissingCredentialError | MCPExternalError | AgorSetupError {
-  // Pass-through guards for already typed instances
-  if (error instanceof MCPExternalError) return error;
-  if (isMCPDuckType(error)) return error as MCPExternalError;
-  if (error instanceof ClaudeExecutionError || error instanceof ClaudeMissingCredentialError) {
-    return error;
-  }
-  if (isAgorSetupError(error)) return error;
-
-  if (error instanceof MissingCredentialError) {
-    return new ClaudeMissingCredentialError(error.message || MESSAGES.missingCredential, {
-      cause: error,
+export function sanitizeClaudeExecutionError(error: unknown): Error {
+  if (isClaudeAbortError(error)) return error as Error;
+  if (instanceOf(error, ClaudeExecutionError) || instanceOf(error, AgorSetupError)) return error;
+  if (instanceOf(error, MCPExternalError)) return error;
+  if (own(error, 'name') === 'MCPExternalError') {
+    // Transported objects are not trusted instances: reconstruct fixed MCP prose.
+    return asMCPExternalError(error, {
+      stage: 'runtime',
+      category: own(error, 'category') as MCPExternalErrorCategory,
     });
   }
-
-  const ctx = buildClassificationContext(error);
   const diag = {
     cause: error,
-    exitCode: ctx.exitCode,
-    signal: ctx.signal,
-    errorClass: ctx.errorClass,
-    code: ctx.code,
+    exitCode: exitCode(own(error, 'exitCode')),
+    signal: allowed(own(error, 'signal'), SIGNALS),
+    errorClass: allowed(own(error, 'errorClass'), ERROR_CLASSES),
+    code: allowed(own(error, 'code'), NETWORK_CODES) ?? allowed(own(error, 'code'), PROCESS_CODES),
   };
+  // Structured process failure is authoritative. Its stderr may describe an
+  // unrelated MCP login or command failure; don't reinterpret that as Claude auth.
+  switch (diag.errorClass) {
+    case 'executable_not_found':
+      return failure('process_failure', MESSAGES.executableNotFound, diag);
+    case 'executable_launch_failed':
+      return failure('process_failure', MESSAGES.executableLaunchFailed, diag);
+    case 'spawn_failed':
+    case 'process_error':
+      return failure('process_failure', MESSAGES.spawnFailed, diag);
+    case 'initialize_timeout':
+      return failure('process_failure', MESSAGES.initializeTimeout, diag);
+    case 'process_killed_by_signal':
+      return failure('process_failure', MESSAGES.processSignal(diag.signal), diag);
+    case 'process_exited_nonzero':
+      return failure('process_failure', MESSAGES.processExit(diag.exitCode), diag);
+  }
+  if (diag.signal) return failure('process_failure', MESSAGES.processSignal(diag.signal), diag);
+  if (diag.exitCode !== undefined && diag.exitCode !== 0)
+    return failure('process_failure', MESSAGES.processExit(diag.exitCode), diag);
+  const fromStatus = httpFailure(own(error, 'status') ?? own(error, 'statusCode'), diag);
+  if (fromStatus) return fromStatus;
+  if (diag.code && NETWORK_CODES.has(diag.code)) return failure('network', MESSAGES.network, diag);
+  const message = typeof error === 'string' ? error : own(error, 'message');
+  // Older CLI versions lack structured process diagnostics. Restrict fallback to
+  // their prefix, not numbers or credentials embedded in stderr.
+  if (typeof message === 'string' && /^Claude Code process exited with code \d+\b/.test(message)) {
+    return failure('process_failure', MESSAGES.processExit(), diag);
+  }
+  return textFailure(message, diag) ?? failure('unknown', MESSAGES.unknown, diag);
+}
 
-  for (const rule of CLASSIFICATION_RULES) {
-    if (rule.test(ctx)) {
-      const text = typeof rule.message === 'function' ? rule.message(ctx) : rule.message;
-      return rule.isMissingCredential
-        ? new ClaudeMissingCredentialError(text, diag)
-        : new ClaudeExecutionError(rule.category, text, diag);
+/** Result adapter: diagnoses without throwing, so partial output and accounting survive. */
+export function classifyClaudeResultFailure(result: unknown): ClaudeExecutionError | undefined {
+  const safe = projectClaudeResultResponse(result);
+  if (!safe || (safe.subtype === 'success' && safe.is_error !== true)) return undefined;
+  const diag = { errorClass: safe.subtype };
+  const limit = limitFailure(safe.subtype, diag);
+  if (limit) return limit;
+  if (safe.is_error === true) {
+    if (safe.subtype === 'success') {
+      const inferred = textFailure(own(result, 'result'), diag);
+      if (inferred) return inferred;
+    } else {
+      const errors = own(result, 'errors');
+      // Multiple contradictory/unrecognized reasons are not a reliable diagnosis.
+      // Read length as data too: a proxy/getter must not turn diagnosis into a
+      // thrown failure that bypasses result accounting and cleanup.
+      const length = own(errors, 'length');
+      if (typeof length === 'number' && Number.isInteger(length) && length > 0 && length <= 8) {
+        const diagnoses = Array.from({ length }, (_, i) =>
+          textFailure(own(errors, String(i)), diag)
+        );
+        const first = diagnoses[0];
+        if (first && diagnoses.every((item) => item?.category === first.category)) return first;
+      }
     }
   }
-
-  return new ClaudeExecutionError('unknown', MESSAGES.unknown, diag);
+  return failure('unknown', SAFE_ZERO_TURN_PROVIDER_RESULT_MESSAGE, diag);
 }

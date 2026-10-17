@@ -66,7 +66,7 @@ import {
   shippedAsanaInstall,
   userEnvBearerInstall,
 } from '../../../test/helpers/real-mcp-scoping.js';
-import { AgorSetupError, ClaudeExecutionError } from './claude-error.js';
+import { AgorSetupError } from './claude-error.js';
 import { CLAUDE_CODE_DISALLOWED_TOOLS, CLAUDE_CODE_TODO_TOOLS } from './constants.js';
 import { formatListForLog, type QuerySetupDeps, setupQuery } from './query-builder.js';
 
@@ -1704,50 +1704,17 @@ describe('setupQuery - setup error handling', () => {
     );
   });
 
-  it('classifies a failure inside loadManagedAgenticToolSdk as a Claude execution error', async () => {
+  it('keeps SDK module-loading failures separate from provider authentication', async () => {
     const { loadManagedAgenticToolSdk } = await import('@agor/core/agentic-integrations');
-    const exitError = Object.assign(
-      new Error('Claude Code process exited with code 127. stderr: command not found'),
-      { exitCode: 127, errorClass: 'process_exited_nonzero' }
+    vi.mocked(loadManagedAgenticToolSdk).mockRejectedValueOnce(
+      new Error('Invalid API key in package path SECRET')
     );
-    vi.mocked(loadManagedAgenticToolSdk).mockRejectedValueOnce(exitError);
-
-    const d = createMinimalQueryDeps();
-    await expect(setupQuery('test-session' as SessionID, 'test prompt', d)).rejects.toSatisfy(
-      (err: unknown) => {
-        expect(err).toBeInstanceOf(ClaudeExecutionError);
-        const claudeErr = err as ClaudeExecutionError;
-        expect(claudeErr.category).toBe('process_failure');
-        expect(claudeErr.exitCode).toBe(127);
-        expect(claudeErr.message).toBe(
-          'Claude Code process exited unexpectedly (code 127). Retry your request, or check the logs if the issue persists.'
-        );
-        return true;
-      }
-    );
-  });
-
-  // Non-process SDK-load failures (e.g. package resolution failure, corrupted module)
-  // are caught in the query setup block and sanitized. Without specific process exit
-  // or provider error text, they classify safely as 'unknown' execution failures rather
-  // than setup failures, preserving the underlying error as .cause for server logs.
-  it('classifies a non-process error from loadManagedAgenticToolSdk as an unknown Claude execution error', async () => {
-    const { loadManagedAgenticToolSdk } = await import('@agor/core/agentic-integrations');
-    const plainError = new Error('Failed to resolve dynamic SDK bundle');
-    vi.mocked(loadManagedAgenticToolSdk).mockRejectedValueOnce(plainError);
-
-    const d = createMinimalQueryDeps();
-    await expect(setupQuery('test-session' as SessionID, 'test prompt', d)).rejects.toSatisfy(
-      (err: unknown) => {
-        expect(err).toBeInstanceOf(ClaudeExecutionError);
-        const claudeErr = err as ClaudeExecutionError;
-        expect(claudeErr.category).toBe('unknown');
-        expect(claudeErr.message).toBe(
-          'Claude Code execution failed. Retry your request, or check the operational logs if the issue persists.'
-        );
-        expect(claudeErr.cause).toBe(plainError);
-        return true;
-      }
-    );
+    await expect(
+      setupQuery('test-session' as SessionID, 'test prompt', createMinimalQueryDeps())
+    ).rejects.toMatchObject({
+      name: 'AgorSetupError',
+      message:
+        'Claude Code runtime could not be loaded. Ask your administrator to check the managed runtime installation.',
+    });
   });
 });

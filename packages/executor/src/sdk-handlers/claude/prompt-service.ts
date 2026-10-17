@@ -5,9 +5,12 @@
  * Automatically loads CLAUDE.md and uses preset system prompts matching Claude Code CLI.
  */
 
-import { projectClaudeResultResponse, projectContextUsageSnapshot } from '@agor/core';
+import {
+  projectClaudeResultResponse,
+  projectContextUsageSnapshot,
+  SAFE_ZERO_TURN_PROVIDER_RESULT_MESSAGE,
+} from '@agor/core';
 import { shortId } from '@agor/core/db';
-import { isMCPAbortError } from '@agor/core/mcp';
 import type { PermissionMode, SDKResultMessage } from '@agor/core/sdk';
 import type { PromptOrigin, Task } from '@agor/core/types';
 import type {
@@ -35,6 +38,7 @@ import {
 } from './background-task-lifecycle.js';
 import { AWAIT_TIMEOUT, awaitWithTimeout } from './bounded-await.js';
 import {
+  ClaudeExecutionError,
   isClaudeAbortError,
   logClaudeFailure,
   sanitizeClaudeExecutionError,
@@ -197,6 +201,31 @@ If you continue to see authentication errors, please contact your Agor administr
     onActivity?: SdkActivityCallback,
     promptOrigin?: PromptOrigin
   ): AsyncGenerator<ProcessedEvent> {
+    yield* this.promptSessionEvents(sessionId, prompt, {
+      taskId,
+      permissionMode,
+      abortController,
+      onActivity,
+      promptOrigin,
+      resume: true,
+      enableTokenStreaming: ClaudePromptService.ENABLE_TOKEN_STREAMING,
+    });
+  }
+
+  private async *promptSessionEvents(
+    sessionId: SessionID,
+    prompt: string,
+    options: {
+      taskId?: TaskID;
+      permissionMode?: PermissionMode;
+      abortController?: AbortController;
+      onActivity?: SdkActivityCallback;
+      promptOrigin?: PromptOrigin;
+      resume: boolean;
+      enableTokenStreaming: boolean;
+    }
+  ): AsyncGenerator<ProcessedEvent> {
+    const { taskId, permissionMode, abortController, onActivity, promptOrigin } = options;
     // Intercept slash commands that don't work via the Claude Agent SDK.
     // Commands like /compact and /cost are handled natively by the SDK and pass through.
     // Commands like /clear, /help, /usage are CLI-only and return "Unknown skill" errors
@@ -254,29 +283,36 @@ If you continue to see authentication errors, please contact your Agor administr
       }
     }
 
-    const setupResult = await this._setupQuerySafe(sessionId, prompt, {
-      taskId,
-      permissionMode,
-      resume: true,
-      abortController,
-      promptOrigin,
-    });
+    let setupResult: Awaited<ReturnType<typeof setupQuery>>;
+    try {
+      setupResult = await this.createQuery(sessionId, prompt, {
+        taskId,
+        permissionMode,
+        resume: options.resume,
+        abortController,
+        promptOrigin,
+      });
+    } catch (error) {
+      if (isClaudeAbortError(error)) {
+        yield { type: 'stopped' };
+        return;
+      }
+      // setupQuery normalizes only its SDK call; local setup/RPC errors retain
+      // their identity and are never reinterpreted as provider authentication.
+      logClaudeFailure(
+        '[claude.query] setup_failed',
+        error,
+        { sessionId: shortId(sessionId) },
+        this.logger
+      );
+      throw error;
+    }
 
     const { query: result, getStderrMetadata, refreshMcp } = setupResult;
 
-    // Get session for reference (needed to check existing sdk_session_id)
-    const session = await this.sessionsRepo?.findById(sessionId);
-    const existingSdkSessionId = session?.sdk_session_id;
-
-    // Create message processor for this query
-    const processor = new SDKMessageProcessor({
-      sessionId,
-      existingSdkSessionId,
-      enableTokenStreaming: ClaudePromptService.ENABLE_TOKEN_STREAMING,
-    });
+    let processor: SDKMessageProcessor | undefined;
     const backgroundTasks = new ClaudeBackgroundTaskLifecycle();
     const sdkResults: SDKResultMessage[] = [];
-    let contextUsageWarnedThisSession = false;
     const clearBackgroundTaskActivity = () => {
       const activeTaskCount = backgroundTasks.clearActiveTasks();
       for (let index = 0; index < activeTaskCount; index++) {
@@ -318,7 +354,21 @@ If you continue to see authentication errors, please contact your Agor administr
     // finalization `for await` did on break (see the `finally` below).
     const iterator = result[Symbol.asyncIterator]();
     let awaitingPostResultContinuation = false;
+    const readNext = async () => {
+      try {
+        return await iterator.next();
+      } catch (error) {
+        throw sanitizeClaudeExecutionError(error);
+      }
+    };
     try {
+      const session = await this.sessionsRepo?.findById(sessionId);
+      const existingSdkSessionId = session?.sdk_session_id;
+      processor = new SDKMessageProcessor({
+        sessionId,
+        existingSdkSessionId,
+        enableTokenStreaming: options.enableTokenStreaming,
+      });
       while (true) {
         let iteration: Awaited<ReturnType<typeof iterator.next>> | typeof AWAIT_TIMEOUT;
         if (awaitingPostResultContinuation) {
@@ -328,9 +378,9 @@ If you continue to see authentication errors, please contact your Agor administr
             backgroundTasks.activeTaskCount > 0
               ? ClaudePromptService.BACKGROUND_TASK_ACTIVE_TIMEOUT_MS
               : ClaudePromptService.POST_RESULT_CONTINUATION_GRACE_MS;
-          iteration = await awaitWithTimeout(iterator.next(), budget);
+          iteration = await awaitWithTimeout(readNext(), budget);
         } else {
-          iteration = await iterator.next();
+          iteration = await readNext();
         }
 
         if (iteration === AWAIT_TIMEOUT) {
@@ -458,33 +508,25 @@ If you continue to see authentication errors, please contact your Agor administr
           // stdin.  We must release it afterward regardless of success/failure.
           if (event.type === 'result') {
             sdkResults.push(event.raw_sdk_message);
-            // The normal path masks any error result (notably a zero-turn
-            // `error_during_execution`) with a generic "provider ended the
-            // request" message. Emit a BOUNDED, sanitized breadcrumb so the
-            // failure is visible in logs — subtype, error flag, turn count, and
-            // the stderr byte length only. The raw result and raw CLI stderr are
-            // deliberately NOT logged here: they can carry MCP URLs/headers,
-            // credentials, or reflected provider payloads (the catch-path below
-            // documents the same policy).
-            {
-              const safeResult = projectClaudeResultResponse(event.raw_sdk_message);
-              const state = processor.getState();
-              if (
-                !safeResult ||
-                safeResult.is_error === true ||
-                safeResult.subtype !== 'success' ||
-                state.assistantMessageCount === 0
-              ) {
-                const stderr = getStderrMetadata();
-                console.error(
-                  `[executor:error] [claude-code] error result for session ${shortId(sessionId)} ` +
-                    `subtype=${safeResult?.subtype ?? 'unknown'} ` +
-                    `is_error=${safeResult?.is_error ?? 'unknown'} ` +
-                    `num_turns=${safeResult?.num_turns ?? 'unknown'} ` +
-                    `stderr_bytes=${stderr.byteLength} ` +
-                    `messages=${state.messageCount} assistants=${state.assistantMessageCount} pending_tools=${state.toolNamesByUseId.size} text_deltas=${state.hasTextDeltas}`
-                );
-              }
+            const safeResult = projectClaudeResultResponse(event.raw_sdk_message);
+            const state = processor.getState();
+            if (event.failure || !safeResult || state.assistantMessageCount === 0) {
+              const stderr = getStderrMetadata();
+              // One bounded event for the diagnosis plus stream-shape evidence.
+              // Keep the zero-assistant breadcrumb even for apparent success.
+              logClaudeFailure(
+                `[claude.query] result_failed subtype=${safeResult?.subtype ?? 'unknown'} ` +
+                  `stderr_bytes=${stderr.byteLength} assistants=${state.assistantMessageCount} text_deltas=${state.hasTextDeltas}`,
+                event.failure ??
+                  new ClaudeExecutionError('unknown', SAFE_ZERO_TURN_PROVIDER_RESULT_MESSAGE),
+                {
+                  sessionId: shortId(sessionId),
+                  taskId: taskId ? shortId(taskId) : undefined,
+                  messageCount: state.messageCount,
+                  hasStderr: stderr.hasStderr,
+                },
+                this.logger
+              );
             }
             if (resultDisposition === 'await-background-tasks') {
               // Bound the wait: from here every `next()` is raced against the
@@ -519,14 +561,12 @@ If you continue to see authentication errors, please contact your Agor administr
                   }
                 }
               } catch (error) {
-                if (!contextUsageWarnedThisSession) {
-                  contextUsageWarnedThisSession = true;
-                  const safe = sanitizeClaudeExecutionError(error);
-                  const category = 'category' in safe ? safe.category : 'unknown';
-                  console.warn(
-                    `[executor:warn] getContextUsage() unavailable category=${category} (suppressing further warnings for this session)`
-                  );
-                }
+                logClaudeFailure(
+                  '[claude.query] context_usage_unavailable',
+                  sanitizeClaudeExecutionError(error),
+                  { sessionId: shortId(sessionId) },
+                  { error: (...args) => console.warn(...args) }
+                );
               } finally {
                 // Release the held input iterable so the SDK can close stdin
                 result.releaseInput();
@@ -558,11 +598,11 @@ If you continue to see authentication errors, please contact your Agor administr
       clearBackgroundTaskActivity();
       result.releaseInput();
 
-      const state = processor.getState();
+      const state = processor?.getState();
 
       // Check if this is an AbortError from AbortController.abort()
       // This is EXPECTED during stop - the SDK throws AbortError when cancelled
-      if (isMCPAbortError(error) || isClaudeAbortError(error)) {
+      if (isClaudeAbortError(error)) {
         console.log(
           `[executor:stop] Query aborted for session ${shortId(sessionId)} - this is expected`
         );
@@ -575,19 +615,18 @@ If you continue to see authentication errors, please contact your Agor administr
       // stderr and SDK exceptions can contain MCP URLs, headers, or reflected
       // provider payloads. Retain only presence + closed failure metadata.
       const stderr = getStderrMetadata();
-      const safe = sanitizeClaudeExecutionError(error);
       logClaudeFailure(
         '[executor:error] SDK iteration failed:',
-        safe,
+        error,
         {
           sessionId: shortId(sessionId),
           taskId: taskId ? shortId(taskId) : undefined,
-          messageCount: state.messageCount,
+          messageCount: state?.messageCount,
           hasStderr: stderr.hasStderr,
         },
         this.logger
       );
-      throw safe;
+      throw error;
     } finally {
       unregisterMcpRefresh?.();
       // Manual iteration means we own the finalization `for await` did on break:
@@ -628,100 +667,28 @@ If you continue to see authentication errors, please contact your Agor administr
    * @returns Complete assistant response with metadata
    */
   async promptSession(sessionId: SessionID, prompt: string): Promise<PromptResult> {
-    const setupResult = await this._setupQuerySafe(sessionId, prompt, {
-      taskId: undefined,
-      permissionMode: undefined,
+    const messages: PromptResult['messages'] = [];
+    let inputTokens = 0;
+    let outputTokens = 0;
+    let failure: Error | undefined;
+    for await (const event of this.promptSessionEvents(sessionId, prompt, {
       resume: false,
-    });
-
-    const { query: result } = setupResult;
-
-    // Get session for reference
-    const session = await this.sessionsRepo?.findById(sessionId);
-    const existingSdkSessionId = session?.sdk_session_id;
-
-    // Create message processor
-    const processor = new SDKMessageProcessor({
-      sessionId,
-      existingSdkSessionId,
-      enableTokenStreaming: false, // Non-streaming mode
-    });
-
-    // Collect response messages from async generator
-    // IMPORTANT: Keep assistant messages SEPARATE (don't merge into one)
-    const assistantMessages: Array<{
-      content: Array<{
-        type: string;
-        text?: string;
-        id?: string;
-        name?: string;
-        input?: Record<string, unknown>;
-      }>;
-      toolUses?: Array<{ id: string; name: string; input: Record<string, unknown> }>;
-    }> = [];
-
-    // Accumulate token usage from result events
-    let tokenUsage:
-      | {
-          input_tokens?: number;
-          output_tokens?: number;
-          cache_creation_tokens?: number;
-          cache_read_tokens?: number;
-        }
-      | undefined;
-
-    try {
-      for await (const msg of result) {
-        const events = await processor.process(msg);
-
-        for (const event of events) {
-          // Only collect complete assistant messages
-          if (event.type === 'complete' && event.role === MessageRole.ASSISTANT) {
-            assistantMessages.push({
-              content: event.content,
-              toolUses: event.toolUses,
-            });
-          }
-
-          // Capture token usage from result events
-          if (event.type === 'result' && event.raw_sdk_message?.usage) {
-            tokenUsage = event.raw_sdk_message.usage as {
-              input_tokens?: number;
-              output_tokens?: number;
-              cache_creation_tokens?: number;
-              cache_read_tokens?: number;
-            };
-          }
-
-          // Break on end event
-          if (event.type === 'end') {
-            break;
-          }
-        }
+      enableTokenStreaming: false,
+    })) {
+      if (event.type === 'complete' && event.role === MessageRole.ASSISTANT) {
+        messages.push({ content: event.content, toolUses: event.toolUses });
       }
-    } catch (error) {
-      // Check if this is an AbortError from interrupt() - this is EXPECTED during stop
-      if (isMCPAbortError(error) || isClaudeAbortError(error)) {
-        console.log(
-          `[executor:stop] Query aborted via interrupt() for session ${shortId(sessionId)} (non-streaming) - this is expected`
-        );
-        // Don't throw - this is a clean stop, not an error
-        // Return empty result since we were stopped
-        return {
-          messages: assistantMessages,
-          inputTokens: tokenUsage?.input_tokens || 0,
-          outputTokens: tokenUsage?.output_tokens || 0,
-        };
+      if (event.type === 'result') {
+        const result = projectClaudeResultResponse(event.raw_sdk_message);
+        inputTokens = result?.usage?.input_tokens ?? 0;
+        outputTokens = result?.usage?.output_tokens ?? 0;
+        failure = event.failure;
       }
-      throw sanitizeClaudeExecutionError(error);
     }
-
-    // Extract token counts from SDK result metadata
-    return {
-      messages: assistantMessages,
-      inputTokens: tokenUsage?.input_tokens || 0,
-      outputTokens: tokenUsage?.output_tokens || 0,
-    };
+    // This legacy convenience API has no hadError result field. Throw only
+    // after consuming the event pipeline so stdin and subprocess cleanup finish.
+    if (failure) throw failure;
+    return { messages, inputTokens, outputTokens };
   }
 
   /**
@@ -746,48 +713,34 @@ If you continue to see authentication errors, please contact your Agor administr
 
   /**
    * Builds and invokes setupQuery with all repository dependencies from this service instance,
-   * then sanitizes and logs any failure before re-throwing.
-   *
-   * Centralises the repeated try/catch boilerplate that was duplicated between
-   * promptSessionStreaming and promptSession.
+   * without reclassifying local failures as Claude provider errors.
    */
-  private async _setupQuerySafe(
+  private async createQuery(
     sessionId: SessionID,
     prompt: string,
     options: Parameters<typeof setupQuery>[3]
   ): Promise<Awaited<ReturnType<typeof setupQuery>>> {
-    try {
-      return await setupQuery(
-        sessionId,
-        prompt,
-        {
-          sessionsRepo: this.sessionsRepo,
-          reposRepo: this.reposRepo,
-          messagesRepo: this.messagesRepo,
-          apiKey: this.apiKey,
-          sessionMCPRepo: this.sessionMCPRepo,
-          mcpServerRepo: this.mcpServerRepo,
-          permissionService: this.permissionService,
-          tasksService: this.tasksService,
-          mcpEnabled: this.mcpEnabled,
-          sessionsService: this.sessionsService,
-          messagesService: this.messagesService,
-          branchesRepo: this.branchesRepo,
-          usersRepo: this.usersRepo,
-          mcpOAuthAuthHeadersRepo: this.mcpOAuthAuthHeadersRepo,
-          permissionLocks: this.permissionLocks,
-        },
-        options
-      );
-    } catch (error) {
-      const safe = sanitizeClaudeExecutionError(error);
-      logClaudeFailure(
-        '[executor:error] Query setup failed:',
-        safe,
-        { sessionId: shortId(sessionId) },
-        this.logger
-      );
-      throw safe;
-    }
+    return setupQuery(
+      sessionId,
+      prompt,
+      {
+        sessionsRepo: this.sessionsRepo,
+        reposRepo: this.reposRepo,
+        messagesRepo: this.messagesRepo,
+        apiKey: this.apiKey,
+        sessionMCPRepo: this.sessionMCPRepo,
+        mcpServerRepo: this.mcpServerRepo,
+        permissionService: this.permissionService,
+        tasksService: this.tasksService,
+        mcpEnabled: this.mcpEnabled,
+        sessionsService: this.sessionsService,
+        messagesService: this.messagesService,
+        branchesRepo: this.branchesRepo,
+        usersRepo: this.usersRepo,
+        mcpOAuthAuthHeadersRepo: this.mcpOAuthAuthHeadersRepo,
+        permissionLocks: this.permissionLocks,
+      },
+      options
+    );
   }
 }

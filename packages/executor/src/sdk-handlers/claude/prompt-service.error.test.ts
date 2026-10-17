@@ -1,253 +1,234 @@
-import { asMCPExternalError, MCPExternalError } from '@agor/core/mcp';
+import { generateId } from '@agor/core';
+import { asMCPExternalError } from '@agor/core/mcp';
+import type { SDKMessage, SDKResultMessage } from '@agor/core/sdk';
 import type { SessionID } from '@agor/core/types';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-
-vi.mock('./query-builder.js', () => ({
-  setupQuery: vi.fn(),
-}));
-
+import { MissingCredentialError } from '../../handlers/sdk/base-executor.js';
 import { AgorSetupError, ClaudeExecutionError, MESSAGES } from './claude-error.js';
+import type { ProcessedEvent } from './message-processor.js';
 import { ClaudePromptService } from './prompt-service.js';
 import { setupQuery } from './query-builder.js';
 
-const mockSetupQuery = vi.mocked(setupQuery);
-const testSessionId = '01a144e0-408d-7138-9233-93e79ee8bc7e' as SessionID;
+vi.mock('./query-builder.js', () => ({ setupQuery: vi.fn() }));
+const sessionId = generateId() as SessionID;
 
-function createQueryMock(throwError: unknown) {
+function rawResult(
+  subtype: SDKResultMessage['subtype'] = 'success',
+  isError = false
+): SDKResultMessage {
   return {
-    query: {
-      [Symbol.asyncIterator]() {
-        return {
-          next() {
-            return Promise.reject(throwError);
-          },
-        };
-      },
-      releaseInput: vi.fn(),
-      getContextUsage: vi
-        .fn()
-        .mockResolvedValue({ totalTokens: 10, maxTokens: 200_000, percentage: 0.005 }),
-      interrupt: vi.fn().mockResolvedValue(undefined),
-      return: vi.fn().mockResolvedValue({ done: true, value: undefined }),
-    },
-    getStderrMetadata: () => ({ hasStderr: false, byteLength: 0 }),
-    refreshMcp: undefined,
-  };
+    type: 'result',
+    subtype,
+    is_error: isError,
+    num_turns: 1,
+    duration_ms: 10,
+    duration_api_ms: 1,
+    result: 'Invalid API key SECRET',
+    errors: ['Invalid API key SECRET'],
+    stop_reason: null,
+    total_cost_usd: 0.01,
+    usage: { input_tokens: 10, output_tokens: 5 },
+    modelUsage: {},
+    permission_denials: [],
+    uuid: generateId(),
+    session_id: 'sdk-session',
+  } as unknown as SDKResultMessage;
 }
 
-describe('ClaudePromptService error handling', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
+function queryWith(messages: SDKMessage[], error?: unknown) {
+  const iterator = (async function* () {
+    yield* messages;
+    if (error) throw error;
+  })();
+  const next = vi.fn(iterator.next.bind(iterator));
+  iterator.next = next;
+  const query = {
+    [Symbol.asyncIterator]: () => iterator,
+    releaseInput: vi.fn(),
+    getContextUsage: vi
+      .fn()
+      .mockResolvedValue({ totalTokens: 15, maxTokens: 200000, percentage: 0.0075 }),
+    interrupt: vi.fn().mockResolvedValue(undefined),
+    setMcpServers: vi.fn(),
+    return: vi.fn(async (value?: unknown) => iterator.return(value as never)),
+  };
+  vi.mocked(setupQuery).mockResolvedValue({
+    query,
+    resolvedModel: 'claude',
+    getStderrMetadata: () => ({ hasStderr: false, byteLength: 0 }),
+  });
+  return { query, next };
+}
+
+function service() {
+  const sessions = {
+    findById: vi.fn().mockResolvedValue({ sdk_session_id: 'sdk-session' }),
+    update: vi.fn(),
+  };
+  const promptService = new ClaudePromptService({} as never, sessions as never);
+  promptService.logger = { error: vi.fn() };
+  return { promptService, sessions };
+}
+
+async function collect(promptService: ClaudePromptService) {
+  const events: ProcessedEvent[] = [];
+  for await (const event of promptService.promptSessionStreaming(sessionId, 'test'))
+    events.push(event);
+  return events;
+}
+
+describe('Claude provider failure boundaries', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it.each(['streaming', 'non-streaming'] as const)(
+    'normalizes SDK iterator exceptions in %s',
+    async (mode) => {
+      const raw = Object.assign(
+        new Error('Claude Code returned an error result: Invalid API key'),
+        { errorClass: 'error_result' }
+      );
+      const { query } = queryWith([], raw);
+      const { promptService } = service();
+      await expect(
+        mode === 'streaming'
+          ? collect(promptService)
+          : promptService.promptSession(sessionId, 'test')
+      ).rejects.toMatchObject({
+        category: 'authentication',
+        message: MESSAGES.authentication,
+        cause: raw,
+      });
+      expect(query.releaseInput).toHaveBeenCalled();
+      expect(query.return).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  it.each([
+    'success',
+    'error_during_execution',
+    'error_max_turns',
+    'error_max_budget_usd',
+  ] as const)(
+    'diagnoses %s results without consuming a subsequent exception or losing usage',
+    async (subtype) => {
+      const raw = rawResult(subtype, true);
+      const { query, next } = queryWith([raw], new Error('late process failure SECRET'));
+      const { promptService } = service();
+      const events = await collect(promptService);
+      const result = events.find((event) => event.type === 'result');
+      expect(result?.type).toBe('result');
+      if (result?.type !== 'result') throw new Error('missing result');
+      expect(result.failure).toBeInstanceOf(ClaudeExecutionError);
+      expect(result.failure?.category).toBe(
+        subtype === 'error_max_turns'
+          ? 'turn_limit'
+          : subtype === 'error_max_budget_usd'
+            ? 'budget_limit'
+            : 'authentication'
+      );
+      expect(result.failure).not.toBeInstanceOf(MissingCredentialError);
+      expect(result.raw_sdk_message.usage).toEqual(raw.usage);
+      expect(result.raw_sdk_message.total_cost_usd).toBe(raw.total_cost_usd);
+      expect(next).toHaveBeenCalledTimes(1);
+      expect(query.return).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(vi.mocked(promptService.logger.error).mock.calls)).not.toContain(
+        'SECRET'
+      );
+    }
+  );
+
+  it('uses the same result diagnosis in the legacy non-streaming API and closes stdin', async () => {
+    const { query, next } = queryWith(
+      [rawResult('error_max_turns', true)],
+      new Error('late error')
+    );
+    const { promptService } = service();
+    await expect(promptService.promptSession(sessionId, 'test')).rejects.toMatchObject({
+      category: 'turn_limit',
+    });
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(query.releaseInput).toHaveBeenCalledTimes(1);
+    expect(query.return).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(setupQuery).mock.calls[0]?.[3]?.resume).toBe(false);
   });
 
-  it('regression (Issue #3120): preserves Claude SDK failures instead of masking as "The MCP operation failed"', async () => {
-    const sdkError = Object.assign(
-      new Error('Claude Code returned an error result: Invalid API key · Fix external API key'),
-      { errorClass: 'error_result' }
-    );
-    mockSetupQuery.mockResolvedValue(createQueryMock(sdkError) as never);
+  it('does not fail a result when context usage rejects', async () => {
+    const { query } = queryWith([rawResult()]);
+    query.getContextUsage.mockRejectedValue(new Error('socket closed SECRET'));
+    const { promptService } = service();
+    const events = await collect(promptService);
+    expect(events.filter((event) => event.type === 'result')).toHaveLength(1);
+    expect(events.some((event) => event.type === 'context_usage')).toBe(false);
+    expect(query.releaseInput).toHaveBeenCalledTimes(1);
+    expect(query.return).toHaveBeenCalledTimes(1);
+  });
 
-    const service = new ClaudePromptService();
-    const generator = service.promptSessionStreaming(testSessionId, 'test prompt');
-
-    await expect(generator.next()).rejects.toSatisfy((err: unknown) => {
-      expect(err).toBeInstanceOf(ClaudeExecutionError);
-      const claudeErr = err as ClaudeExecutionError;
-      expect(claudeErr.message).not.toContain('The MCP operation failed');
-      expect(claudeErr.message).toBe(MESSAGES.authentication);
-      expect(claudeErr.category).toBe('authentication');
-      expect(claudeErr.cause).toBe(sdkError);
-      return true;
+  it('preserves the original provider failure when teardown rejects', async () => {
+    const { query } = queryWith([], new Error('Invalid API key'));
+    query.return.mockRejectedValue(new Error('cleanup failed'));
+    await expect(collect(service().promptService)).rejects.toMatchObject({
+      category: 'authentication',
     });
   });
 
-  it('passes through genuine MCPExternalError unchanged by identity', async () => {
-    const mcpError = asMCPExternalError(new Error('oauth token request failed'), {
+  it('does not classify session persistence failures as provider auth errors', async () => {
+    const raw = rawResult();
+    raw.session_id = 'new-sdk-session';
+    const { query } = queryWith([raw]);
+    const { promptService, sessions } = service();
+    sessions.findById.mockResolvedValue({ sdk_session_id: undefined });
+    const localError = new Error('Invalid API key: Agor control-plane access revoked SECRET');
+    sessions.update.mockRejectedValue(localError);
+    await expect(collect(promptService)).rejects.toBe(localError);
+    expect(query.return).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(vi.mocked(promptService.logger.error).mock.calls)).not.toContain(
+      'SECRET'
+    );
+  });
+
+  it('closes the SDK query if loading session metadata fails', async () => {
+    const { query, next } = queryWith([]);
+    const { promptService, sessions } = service();
+    const localError = new Error('Agor RPC unavailable');
+    sessions.findById.mockRejectedValue(localError);
+    await expect(collect(promptService)).rejects.toBe(localError);
+    expect(next).not.toHaveBeenCalled();
+    expect(query.return).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    new AgorSetupError('Working directory unavailable'),
+    new Error('Invalid API key: Agor RPC'),
+    new MissingCredentialError('No scoped credential'),
+  ])('preserves setup/preflight failure identity', async (error) => {
+    vi.mocked(setupQuery).mockRejectedValue(error);
+    const { promptService } = service();
+    await expect(collect(promptService)).rejects.toBe(error);
+    await expect(promptService.promptSession(sessionId, 'test')).rejects.toBe(error);
+  });
+
+  it('preserves genuine MCP error identity', async () => {
+    const mcp = asMCPExternalError(new Error('secret'), {
       stage: 'oauth',
       category: 'provider_rejected',
     });
-    mockSetupQuery.mockResolvedValue(createQueryMock(mcpError) as never);
+    queryWith([], mcp);
+    await expect(collect(service().promptService)).rejects.toBe(mcp);
+  });
 
-    const service = new ClaudePromptService();
-    const generator = service.promptSessionStreaming(testSessionId, 'test prompt');
-
-    await expect(generator.next()).rejects.toSatisfy((err: unknown) => {
-      expect(err).toBe(mcpError);
-      expect(err).toBeInstanceOf(MCPExternalError);
-      return true;
+  it.each(['iterator', 'setup'] as const)('preserves SDK cancellation from %s', async (where) => {
+    const abort = Object.assign(new Error('stop'), { errorClass: 'aborted' });
+    queryWith([], abort);
+    if (where === 'setup') vi.mocked(setupQuery).mockRejectedValue(abort);
+    const { promptService } = service();
+    expect(await collect(promptService)).toEqual([{ type: 'stopped' }]);
+    // Use a fresh iterator so the legacy path sees the abort, not an exhausted stream.
+    queryWith([], abort);
+    if (where === 'setup') vi.mocked(setupQuery).mockRejectedValue(abort);
+    expect(await promptService.promptSession(sessionId, 'test')).toEqual({
+      messages: [],
+      inputTokens: 0,
+      outputTokens: 0,
     });
-  });
-
-  it('does not fail stream when getContextUsage rejects', async () => {
-    const releaseInput = vi.fn();
-    const mockResultEvent = {
-      type: 'result',
-      subtype: 'success',
-      duration_ms: 10,
-      duration_api_ms: 1,
-      is_error: false,
-      num_turns: 1,
-      result: 'turn completed successfully',
-      stop_reason: null,
-      total_cost_usd: 0.01,
-      usage: { input_tokens: 10, output_tokens: 5 },
-      uuid: 'test-uuid',
-      session_id: 'sdk-session',
-    };
-
-    let done = false;
-    const queryObj = {
-      [Symbol.asyncIterator]() {
-        return {
-          next() {
-            if (!done) {
-              done = true;
-              return Promise.resolve({ value: mockResultEvent, done: false });
-            }
-            return Promise.resolve({ value: undefined, done: true });
-          },
-        };
-      },
-      releaseInput,
-      getContextUsage: vi.fn().mockRejectedValue(new Error('context usage socket dropped')),
-      interrupt: vi.fn().mockResolvedValue(undefined),
-      return: vi.fn().mockResolvedValue({ done: true, value: undefined }),
-    };
-
-    mockSetupQuery.mockResolvedValue({
-      query: queryObj as never,
-      getStderrMetadata: () => ({ hasStderr: false, byteLength: 0 }),
-      refreshMcp: undefined,
-    } as never);
-
-    const service = new ClaudePromptService();
-    const events: Array<{ type: string }> = [];
-
-    for await (const event of service.promptSessionStreaming(testSessionId, 'test prompt')) {
-      events.push(event as { type: string });
-    }
-
-    expect(events.filter((e) => e.type === 'result')).toHaveLength(1);
-    expect(events.filter((e) => e.type === 'context_usage')).toHaveLength(0);
-    expect(releaseInput).toHaveBeenCalledTimes(1);
-  });
-
-  it('cleanup rejection does not mask original error', async () => {
-    const returnSpy = vi.fn().mockRejectedValue(new Error('cleanup socket already closed'));
-    const originalError = Object.assign(new Error('Invalid API key'), {
-      errorClass: 'error_result',
-    });
-    const queryMock = createQueryMock(originalError);
-    queryMock.query.return = returnSpy;
-    mockSetupQuery.mockResolvedValue(queryMock as never);
-
-    const service = new ClaudePromptService();
-    const generator = service.promptSessionStreaming(testSessionId, 'test prompt');
-
-    await expect(generator.next()).rejects.toSatisfy((err: unknown) => {
-      expect(err).toBeInstanceOf(ClaudeExecutionError);
-      expect((err as ClaudeExecutionError).category).toBe('authentication');
-      expect((err as ClaudeExecutionError).cause).toBe(originalError);
-      return true;
-    });
-    expect(returnSpy).toHaveBeenCalledTimes(1);
-  });
-
-  it('surfaces AgorSetupError unmasked in both promptSessionStreaming and promptSession', async () => {
-    const setupErr = new AgorSetupError(
-      'Working directory for this session is unavailable. The branch may not be initialized.'
-    );
-    mockSetupQuery.mockRejectedValue(setupErr);
-
-    const service = new ClaudePromptService();
-
-    // 1. Streaming
-    const generator = service.promptSessionStreaming(testSessionId, 'test prompt');
-    await expect(generator.next()).rejects.toSatisfy((err: unknown) => {
-      expect(err).toBe(setupErr);
-      expect((err as Error).message).not.toContain('/');
-      return true;
-    });
-
-    // 2. Non-streaming
-    await expect(service.promptSession(testSessionId, 'test prompt')).rejects.toSatisfy(
-      (err: unknown) => {
-        expect(err).toBe(setupErr);
-        expect((err as Error).message).not.toContain('/');
-        return true;
-      }
-    );
-  });
-
-  it('handles Claude SDK abort without throwing: yields stopped in streaming, returns in non-streaming', async () => {
-    const sdkAbort = Object.assign(new Error('Claude Code process aborted by user'), {
-      telemetryMessage: 'Claude Code process aborted by user',
-      errorClass: 'aborted',
-    });
-    mockSetupQuery.mockResolvedValue(createQueryMock(sdkAbort) as never);
-
-    const service = new ClaudePromptService();
-
-    // Streaming yields { type: 'stopped' } and finishes cleanly
-    const events: Array<{ type: string }> = [];
-    for await (const event of service.promptSessionStreaming(testSessionId, 'test prompt')) {
-      events.push(event as { type: string });
-    }
-    expect(events).toEqual([{ type: 'stopped' }]);
-
-    // Non-streaming returns partial result cleanly
-    const result = await service.promptSession(testSessionId, 'test prompt');
-    expect(result).toEqual({ messages: [], inputTokens: 0, outputTokens: 0 });
-  });
-
-  it('handles standard MCP AbortError (name: "AbortError") cleanly in streaming', async () => {
-    const mcpAbort = new Error('Operation aborted');
-    mcpAbort.name = 'AbortError';
-    mockSetupQuery.mockResolvedValue(createQueryMock(mcpAbort) as never);
-
-    const service = new ClaudePromptService();
-    const events: Array<{ type: string }> = [];
-    for await (const event of service.promptSessionStreaming(testSessionId, 'test prompt')) {
-      events.push(event as { type: string });
-    }
-    expect(events).toEqual([{ type: 'stopped' }]);
-  });
-
-  it('logs failure via logger with category and message when setupQuery rejects', async () => {
-    const mockLogger = { error: vi.fn() };
-    mockSetupQuery.mockRejectedValue(new Error('Working directory unavailable'));
-    const service = new ClaudePromptService();
-    service.logger = mockLogger;
-    await expect(
-      service.promptSessionStreaming(testSessionId, 'test prompt').next()
-    ).rejects.toThrow();
-
-    expect(mockLogger.error).toHaveBeenCalledWith(
-      '[executor:error] Query setup failed:',
-      expect.objectContaining({
-        category: expect.any(String),
-        message: expect.any(String),
-      })
-    );
-  });
-
-  it('logs AgorSetupError with setup_error category when setupQuery rejects with AgorSetupError', async () => {
-    const mockLogger = { error: vi.fn() };
-    mockSetupQuery.mockRejectedValue(
-      new AgorSetupError('Working directory for this session is unavailable.')
-    );
-    const service = new ClaudePromptService();
-    service.logger = mockLogger;
-    await expect(
-      service.promptSessionStreaming(testSessionId, 'test prompt').next()
-    ).rejects.toThrow();
-
-    expect(mockLogger.error).toHaveBeenCalledWith(
-      '[executor:error] Query setup failed:',
-      expect.objectContaining({
-        category: 'setup_error',
-        message: 'Working directory for this session is unavailable.',
-      })
-    );
   });
 });

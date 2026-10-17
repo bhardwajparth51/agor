@@ -242,9 +242,8 @@ export async function setupQuery(
     } catch (listError) {
       console.warn(`⚠️  Could not list directory contents:`, listError);
     }
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    console.error(`[executor:error] Working directory validation failed: ${errorMessage}`);
+  } catch {
+    console.error('[claude.query] working_directory_unavailable');
     const branchSuffix = session.branch_id
       ? ` Session references branch ${session.branch_id} which may not be initialized.`
       : ' The branch may not be initialized.';
@@ -706,9 +705,16 @@ export async function setupQuery(
     await inputHeldPromise;
   }
 
+  let Claude: typeof ClaudeSdk;
+  try {
+    Claude = await loadManagedAgenticToolSdk<typeof ClaudeSdk>('claude-code');
+  } catch {
+    throw new AgorSetupError(
+      'Claude Code runtime could not be loaded. Ask your administrator to check the managed runtime installation.'
+    );
+  }
   let result: AsyncGenerator<unknown>;
   try {
-    const Claude = await loadManagedAgenticToolSdk<typeof ClaudeSdk>('claude-code');
     result = Claude.query({
       prompt: asUserMessageIterable(prompt),
       // queryOptions uses Record<string,unknown> to accommodate apiKey, which is valid at
