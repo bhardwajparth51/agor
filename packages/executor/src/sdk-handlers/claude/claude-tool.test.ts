@@ -1,4 +1,8 @@
-import { generateId, SAFE_ZERO_TURN_PROVIDER_RESULT_MESSAGE } from '@agor/core';
+import {
+  classifyProviderFallback,
+  generateId,
+  SAFE_ZERO_TURN_PROVIDER_RESULT_MESSAGE,
+} from '@agor/core';
 import type { SDKMessage, SDKResultMessage, SDKSystemMessage } from '@agor/core/sdk';
 import type { Message, SessionID, TaskID } from '@agor/core/types';
 import { MessageRole, withProviderDetail } from '@agor/core/types';
@@ -209,6 +213,42 @@ describe('ClaudeTool provider-failure settlement', () => {
           )
         ).toBe(true);
       }
+      const fallback = classifyProviderFallback({
+        status: result.hadError ? 'failed' : 'completed',
+        error_message: result.errorDetails?.join('; '),
+        raw_sdk_response: result.rawSdkResponse,
+      });
+
+      if (_name === 'empty success') {
+        expect(fallback).toBe('zero_turn');
+      } else if (_name === 'success with error flag') {
+        expect(fallback).toBe('provider_error');
+      } else if (_name === 'error after assistant output') {
+        expect(fallback).toBe('provider_error');
+      } else if (_name === 'EOF before any result' || _name === 'EOF after assistant output') {
+        expect(fallback).toBe('missing_result');
+      }
+    });
+
+    it('accepts successful compaction without zero-turn failure', async () => {
+      const harness = createHarness();
+      promptState.events = [
+        {
+          type: 'system_complete',
+          systemType: 'compaction',
+          metadata: { trigger: 'manual', pre_tokens: 50_000 },
+        },
+        resultEvent(rawResult('success')),
+      ];
+      const result = await execute(harness.tool, mode, generateId() as TaskID);
+      expect(result.hadError).toBe(false);
+      expect(
+        classifyProviderFallback({
+          status: result.hadError ? 'failed' : 'completed',
+          error_message: result.errorDetails?.join('; '),
+          raw_sdk_response: result.rawSdkResponse,
+        })
+      ).toBeUndefined();
     });
 
     it('propagates recorded SDK success/is_error through the real processor without exposing its body', async () => {

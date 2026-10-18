@@ -197,6 +197,7 @@ interface ProcessorState {
   capturedAgentSessionId?: string;
   messageCount: number;
   assistantMessageCount: number;
+  compactionCompleted: boolean;
   hasTextDeltas: boolean;
   lastAssistantMessageTime: number;
   resolvedModel?: string;
@@ -233,6 +234,7 @@ export class SDKMessageProcessor {
       capturedAgentSessionId: undefined,
       messageCount: 0,
       assistantMessageCount: 0,
+      compactionCompleted: false,
       hasTextDeltas: false,
       lastAssistantMessageTime: Date.now(),
       enableTokenStreaming: options.enableTokenStreaming ?? true,
@@ -581,7 +583,7 @@ export class SDKMessageProcessor {
     const result = projectClaudeResultResponse(msg);
     if (result?.subtype === 'success' && result.is_error !== true) {
       const hasAssistantMessages = this.state.assistantMessageCount > 0;
-      if (!hasAssistantMessages) {
+      if (!hasAssistantMessages && !this.state.compactionCompleted) {
         events.push({
           type: 'complete',
           role: MessageRole.ASSISTANT,
@@ -625,6 +627,12 @@ export class SDKMessageProcessor {
 
       // Extract metadata from compact_boundary message
       const metadata = 'compact_metadata' in msg ? msg.compact_metadata : undefined;
+      // Manual compaction (e.g. /compact) is the entire user request, which legitimately
+      // completes without assistant conversational messages. Automatic compaction occurs
+      // mid-turn during regular prompts; an unconfirmed response must still trigger fallback.
+      if (metadata?.trigger === 'manual') {
+        this.state.compactionCompleted = true;
+      }
 
       // Emit event to mark compaction as complete with full metadata
       return [
