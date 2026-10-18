@@ -45,7 +45,10 @@ it('backfills SQLite recency atomically without losing children, indexes or fiel
         await executeRaw(db, sql`SELECT * FROM tasks WHERE task_id = ${fixture.task.task_id}`)
       )
     ).toEqual(fixture.taskRows);
-    expect(await indexes()).toEqual(beforeIndexes);
+    const afterIndexNames = new Set((await indexes()).map((row) => row.name));
+    for (const { name } of beforeIndexes) {
+      expect(afterIndexNames.has(name)).toBe(true);
+    }
     expect(rawRows(await executeRaw(db, sql`PRAGMA foreign_key_check`))).toEqual([]);
     expect(rawRows(await executeRaw(db, sql`PRAGMA foreign_key_list(sessions)`))).toEqual(
       beforeForeignKeys

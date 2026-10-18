@@ -2,13 +2,16 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createClient } from '@libsql/client';
+import { sql } from 'drizzle-orm';
 import { describe, expect, it } from 'vitest';
 import { createDatabase } from './client';
+import { executeRaw, isSQLiteDatabase, rawRows } from './database-wrapper';
 import {
   classifyMigrationWatermark,
   OWNER_ATTRIBUTION_SQLSTATE,
   pendingOfflineCutoverMigrations,
   preflightSQLiteCapabilityPolicyOwners,
+  runMigrations,
 } from './migrate';
 
 interface JournalEntry {
@@ -1434,4 +1437,34 @@ describe('MCP stdio transport repair migrations', () => {
     expect(migration.match(/DROP POLICY "stdio_repair_0096_/g)).toHaveLength(6);
     expect(migration).toContain("SELECT set_config('agor.system_scope', '', true)");
   });
+});
+
+describe('SQLite session indexes restoration migration (0118)', () => {
+  it('restores missing session indexes after the full SQLite migration chain', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'agor-session-indexes-'));
+    const db = createDatabase({ url: `file:${join(directory, 'test.db')}` });
+    try {
+      if (!isSQLiteDatabase(db)) throw new Error('Expected SQLite database');
+
+      await runMigrations(db, { allowOfflineCutover: true });
+
+      const indexList = rawRows(await executeRaw(db, sql`PRAGMA index_list('sessions')`));
+      const indexNames = new Set(indexList.map((row) => row.name));
+      expect(indexNames.has('sessions_agentic_tool_idx')).toBe(true);
+      expect(indexNames.has('sessions_scheduled_flag_idx')).toBe(true);
+
+      const toolCols = rawRows(
+        await executeRaw(db, sql`PRAGMA index_info('sessions_agentic_tool_idx')`)
+      );
+      expect(toolCols.map((c) => c.name)).toEqual(['agentic_tool']);
+
+      const scheduledCols = rawRows(
+        await executeRaw(db, sql`PRAGMA index_info('sessions_scheduled_flag_idx')`)
+      );
+      expect(scheduledCols.map((c) => c.name)).toEqual(['scheduled_from_branch']);
+    } finally {
+      (db as unknown as { $client: { close(): void } }).$client.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30000);
 });

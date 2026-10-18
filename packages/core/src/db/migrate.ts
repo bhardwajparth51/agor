@@ -135,6 +135,18 @@ export function createMigrationImpactRegistry(
 }
 
 const MIGRATION_IMPACT_REGISTRY = createMigrationImpactRegistry([
+  [
+    '0118_restore_session_indexes',
+    {
+      requiresOfflineCutover: false,
+      impact: defineMigrationImpact({
+        classification: 'performance',
+        userAction: 'none',
+        rollbackCompatibility: 'compatible',
+        summary: 'Restores sessions indexes dropped by the 0009 SQLite table rebuild.',
+      }),
+    },
+  ],
   // SQLite and PostgreSQL number the same Teams migration differently.
   ...['0117_teams_gateway_ha', '0118_teams_gateway_ha'].map(
     (name) =>

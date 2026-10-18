@@ -806,6 +806,13 @@
       "when": 1790129000302,
       "tag": "0117_teams_gateway_ha",
       "breakpoints": true
+    },
+    {
+      "idx": 117,
+      "version": "6",
+      "when": 1790129000303,
+      "tag": "0118_restore_session_indexes",
+      "breakpoints": true
     }
   ]
 }
