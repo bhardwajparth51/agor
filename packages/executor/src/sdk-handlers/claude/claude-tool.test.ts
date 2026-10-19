@@ -251,6 +251,41 @@ describe('ClaudeTool provider-failure settlement', () => {
       ).toBeUndefined();
     });
 
+    it.each([
+      { trigger: 'auto' as const, label: 'auto-compaction' },
+      { trigger: undefined, label: 'compaction with missing trigger' },
+    ])(
+      'fails closed with zero-turn fallback when $label finishes without assistant messages',
+      async ({ trigger }) => {
+        const harness = createHarness();
+        const processor = new SDKMessageProcessor({ sessionId: generateId() as SessionID });
+        const events: ProcessedEvent[] = [];
+        events.push(
+          ...(await processor.process({ type: 'system', status: 'compacting' } as never))
+        );
+        events.push(
+          ...(await processor.process({
+            type: 'system',
+            subtype: 'compact_boundary',
+            compact_metadata: trigger ? { trigger, pre_tokens: 50_000 } : undefined,
+          } as never))
+        );
+        events.push(...(await processor.process(rawResult('success') as never)));
+        promptState.events = events;
+
+        const result = await execute(harness.tool, mode, generateId() as TaskID);
+        expect(result.hadError).toBe(true);
+        expect(result.errorDetails).toEqual([SAFE_ZERO_TURN_PROVIDER_RESULT_MESSAGE]);
+        expect(
+          classifyProviderFallback({
+            status: result.hadError ? 'failed' : 'completed',
+            error_message: result.errorDetails?.join('; '),
+            raw_sdk_response: result.rawSdkResponse,
+          })
+        ).toBe('zero_turn');
+      }
+    );
+
     it('propagates recorded SDK success/is_error through the real processor without exposing its body', async () => {
       const harness = createHarness();
       const processor = new SDKMessageProcessor({ sessionId: generateId() as SessionID });

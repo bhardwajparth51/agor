@@ -639,5 +639,29 @@ describe('Task/executor lifecycle metrics', () => {
 
       expect(metrics.calls.find((c) => c.name === 'task.provider_fallback')).toBeUndefined();
     });
+
+    it('does not double-count provider_fallback on repeated terminal settlement of the same task', () => {
+      const metrics = new RecordingMetrics();
+      const failedTask = {
+        ...task,
+        status: 'failed',
+        error_message:
+          'Agor could not confirm a successful response. Review any output and tool activity before retrying.',
+        raw_sdk_response: { type: 'result', subtype: 'success', is_error: false },
+        recorded_tool_count: 0,
+        metadata: { source: 'agor' },
+        executor_mode: 'local',
+      } as unknown as Task;
+
+      recordTaskSettlement(metrics, failedTask);
+      recordTaskSettlement(metrics, failedTask);
+
+      const fallbackCalls = metrics.calls.filter((c) => c.name === 'task.provider_fallback');
+      expect(fallbackCalls).toHaveLength(1);
+      expect(fallbackCalls[0].value).toBe(1);
+
+      const settlementCalls = metrics.calls.filter((c) => c.name === 'task.settlements');
+      expect(settlementCalls).toHaveLength(1);
+    });
   });
 });

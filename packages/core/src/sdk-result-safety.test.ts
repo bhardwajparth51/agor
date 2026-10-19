@@ -5,6 +5,8 @@ import {
   projectClaudeResultResponse,
   projectContextUsageSnapshot,
   projectNormalizedSdkResponse,
+  SAFE_MISSING_PROVIDER_RESULT_MESSAGE,
+  SAFE_ZERO_TURN_PROVIDER_RESULT_MESSAGE,
 } from './sdk-result-safety';
 
 describe('projectClaudeResultResponse', () => {
@@ -167,114 +169,102 @@ describe('claudeResultFailureCode', () => {
 });
 
 describe('classifyProviderFallback', () => {
-  it('classifies zero_turn when a success result produced no assistant response', () => {
-    expect(
-      classifyProviderFallback({
+  it.each([
+    {
+      description: 'safe zero-turn message + success raw -> zero_turn',
+      task: {
         status: 'failed',
-        error_message:
-          'Agor could not confirm a successful response. Review any output and tool activity before retrying.',
+        error_message: SAFE_ZERO_TURN_PROVIDER_RESULT_MESSAGE,
         raw_sdk_response: { type: 'result', subtype: 'success', is_error: false },
-      })
-    ).toBe('zero_turn');
-
-    // Also supports legacy text
-    expect(
-      classifyProviderFallback({
+      },
+      expected: 'zero_turn',
+    },
+    {
+      description: 'legacy zero-turn message + success raw -> zero_turn',
+      task: {
         status: 'failed',
         error_message:
           'The provider ended the request without returning a model response. Retry the prompt.',
         raw_sdk_response: { type: 'result', subtype: 'success', is_error: false },
-      })
-    ).toBe('zero_turn');
-  });
-
-  it('classifies provider_error when result reports an error subtype', () => {
-    expect(
-      classifyProviderFallback({
+      },
+      expected: 'zero_turn',
+    },
+    {
+      description: 'safe zero-turn message + non-success subtype -> provider_error',
+      task: {
         status: 'failed',
-        error_message:
-          'Agor could not confirm a successful response. Review any output and tool activity before retrying. Provider detail: error_during_execution',
+        error_message: SAFE_ZERO_TURN_PROVIDER_RESULT_MESSAGE,
         raw_sdk_response: { type: 'result', subtype: 'error_during_execution', is_error: true },
-      })
-    ).toBe('provider_error');
-  });
-
-  it('classifies provider_error from structured raw response even when provider detail code is unavailable in error_message', () => {
-    expect(
-      classifyProviderFallback({
+      },
+      expected: 'provider_error',
+    },
+    {
+      description: 'safe zero-turn message + is_error: true -> provider_error',
+      task: {
         status: 'failed',
-        error_message:
-          'Agor could not confirm a successful response. Review any output and tool activity before retrying.',
-        raw_sdk_response: { type: 'result', subtype: 'error_during_execution', is_error: true },
-      })
-    ).toBe('provider_error');
-  });
-
-  it('classifies provider_error when result has subtype success but is_error true', () => {
-    expect(
-      classifyProviderFallback({
-        status: 'failed',
-        error_message:
-          'Agor could not confirm a successful response. Review any output and tool activity before retrying. Provider detail: is_error',
+        error_message: SAFE_ZERO_TURN_PROVIDER_RESULT_MESSAGE,
         raw_sdk_response: { type: 'result', subtype: 'success', is_error: true },
-      })
-    ).toBe('provider_error');
-  });
-
-  it('classifies provider_error when provider detail is appended even if raw response is absent', () => {
-    expect(
-      classifyProviderFallback({
+      },
+      expected: 'provider_error',
+    },
+    {
+      description: 'provider detail appended without raw response -> provider_error',
+      task: {
         status: 'failed',
-        error_message:
-          'Agor could not confirm a successful response. Review any output and tool activity before retrying. Provider detail: error_max_turns',
-      })
-    ).toBe('provider_error');
-  });
-
-  it('classifies missing_result when stream ends without a terminal result', () => {
-    expect(
-      classifyProviderFallback({
+        error_message: `${SAFE_ZERO_TURN_PROVIDER_RESULT_MESSAGE} Provider detail: error_max_turns`,
+      },
+      expected: 'provider_error',
+    },
+    {
+      description: 'missing-result message -> missing_result',
+      task: {
         status: 'failed',
-        error_message:
-          'The Claude Code stream closed without a final result. Completion could not be confirmed. Review any output and tool activity before retrying.',
-      })
-    ).toBe('missing_result');
-  });
-
-  it('returns undefined for non-failed tasks', () => {
-    expect(
-      classifyProviderFallback({
+        error_message: SAFE_MISSING_PROVIDER_RESULT_MESSAGE,
+      },
+      expected: 'missing_result',
+    },
+    {
+      description: 'completed task -> undefined',
+      task: {
         status: 'completed',
         error_message: null,
-      })
-    ).toBeUndefined();
-    expect(
-      classifyProviderFallback({
+      },
+      expected: undefined,
+    },
+    {
+      description: 'running task -> undefined',
+      task: {
         status: 'running',
         error_message: null,
-      })
-    ).toBeUndefined();
-  });
-
-  it('returns undefined for unrelated failures', () => {
-    expect(
-      classifyProviderFallback({
+      },
+      expected: undefined,
+    },
+    {
+      description: 'permission timeout -> undefined',
+      task: {
+        status: 'failed',
+        error_message: 'Permission request timed out after 30000ms.',
+      },
+      expected: undefined,
+    },
+    {
+      description: 'memory limit -> undefined',
+      task: {
+        status: 'failed',
+        error_message: 'The agent went over its 6 GiB memory limit and was stopped.',
+      },
+      expected: undefined,
+    },
+    {
+      description: 'concurrency limit -> undefined',
+      task: {
         status: 'failed',
         error_message:
           'Your team has reached its limit of work running at once. Wait for something to finish, then try again.',
-      })
-    ).toBeUndefined();
-    expect(
-      classifyProviderFallback({
-        status: 'failed',
-        error_message: 'Permission request timed out after 30000ms.',
-      })
-    ).toBeUndefined();
-    expect(
-      classifyProviderFallback({
-        status: 'failed',
-        error_message: 'The agent went over its 6 GiB memory limit and was stopped.',
-      })
-    ).toBeUndefined();
+      },
+      expected: undefined,
+    },
+  ])('$description', ({ task, expected }) => {
+    expect(classifyProviderFallback(task)).toBe(expected);
   });
 });

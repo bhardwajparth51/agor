@@ -17,6 +17,7 @@ function taskSurface(task: Task): 'gateway' | 'ui' | 'unknown' {
   return 'unknown';
 }
 
+// 0 -> none, 1-4 -> short, >=5 -> long, non-finite/null -> unknown
 function toolChainLength(task: Task): 'none' | 'short' | 'long' | 'unknown' {
   if (task.recorded_tool_count == null || !Number.isFinite(task.recorded_tool_count)) {
     return 'unknown';
@@ -61,7 +62,14 @@ export function recordExecutorConnected(metrics: DaemonMetrics, task: Task): voi
   }
 }
 
+const settledTasks = new WeakSet<object>();
+
 export function recordTaskSettlement(metrics: DaemonMetrics, task: Task): void {
+  if (settledTasks.has(task)) {
+    return;
+  }
+  settledTasks.add(task);
+
   const tags = { status: task.status, mode: executorMode(task) } as const;
   metrics.increment('task.settlements', 1, tags);
 
