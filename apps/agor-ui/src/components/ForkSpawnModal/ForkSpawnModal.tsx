@@ -129,22 +129,20 @@ export const ForkSpawnModal: React.FC<ForkSpawnModalProps> = ({
     [currentUser, session]
   );
 
-  // Track the session for which form baseline values were initialized.
-  // Realtime updates to the active session must not wipe prompt drafts or user edits.
+  // Only seed when the modal opens or the session actually changes.
+  // Live query updates produce new object references for the same session_id.
+  const sessionId = session?.session_id ?? null;
   const lastSessionIdRef = useRef<string | null>(null);
 
-  // Initialize form baseline when modal opens or switches to a different session
   useEffect(() => {
-    if (!open || !session) {
+    if (!open || !sessionId || !session) {
       lastSessionIdRef.current = null;
       return;
     }
 
-    if (lastSessionIdRef.current === session.session_id) {
-      return;
-    }
+    if (lastSessionIdRef.current === sessionId) return;
 
-    lastSessionIdRef.current = session.session_id;
+    lastSessionIdRef.current = sessionId;
     setConfigPreset('parent');
     setEnvVarNames([]);
     const agentTool = isAgenticToolName(session.agentic_tool)
@@ -157,7 +155,7 @@ export const ForkSpawnModal: React.FC<ForkSpawnModalProps> = ({
       includeOriginalPrompt: session.callback_config?.include_original_prompt,
     });
     setSelectedAgent(agentTool);
-  }, [open, session, form, initialPrompt]);
+  }, [open, sessionId, session, form, initialPrompt]);
 
   const handleConfigPresetChange = (preset: 'parent' | 'custom') => {
     setConfigPreset(preset);
