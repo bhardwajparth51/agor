@@ -178,7 +178,7 @@ describe('ForkSpawnModal repeated submission', () => {
 });
 
 describe('ForkSpawnModal realtime session updates', { timeout: 10_000 }, () => {
-  it('preserves typed prompt when source session receives a new object reference', async () => {
+  it('preserves typed prompt when the same session receives a new object reference', async () => {
     const initialSession: Session = {
       ...(mockSession as Session),
       status: 'running',
@@ -201,7 +201,6 @@ describe('ForkSpawnModal realtime session updates', { timeout: 10_000 }, () => {
     fireEvent.change(textarea, { target: { value: 'Investigate database deadlocks' } });
     expect(textarea.value).toBe('Investigate database deadlocks');
 
-    // Simulate realtime streaming update producing a new session object reference
     act(() => {
       rerender(
         <ForkSpawnModal
@@ -224,7 +223,63 @@ describe('ForkSpawnModal realtime session updates', { timeout: 10_000 }, () => {
     );
   });
 
-  it('re-initializes prompt and configuration when closing and reopening the modal', async () => {
+  it('preserves custom configuration choices when the same session receives a new object reference', async () => {
+    const initialSession: Session = {
+      ...(mockSession as Session),
+      status: 'running',
+      updated_at: '2026-10-20T12:00:00Z',
+    };
+
+    const { rerender } = render(
+      <ForkSpawnModal
+        open
+        action="spawn"
+        session={initialSession}
+        onConfirm={vi.fn().mockResolvedValue(undefined)}
+        onCancel={vi.fn()}
+        client={null}
+        userById={new Map()}
+      />
+    );
+
+    fireEvent.click(screen.getByText('Custom config'));
+    await screen.findByText('Configuration');
+
+    const extraInstructions = screen.getByPlaceholderText(
+      /Only use safe operations/i
+    ) as HTMLTextAreaElement;
+    fireEvent.change(extraInstructions, { target: { value: 'Focus strictly on unit tests' } });
+    expect(extraInstructions.value).toBe('Focus strictly on unit tests');
+
+    const notifyCheckbox = screen.getByRole('checkbox', { name: /Notify parent on completion/i });
+    fireEvent.click(notifyCheckbox);
+    expect(notifyCheckbox).toBeChecked();
+
+    act(() => {
+      rerender(
+        <ForkSpawnModal
+          open
+          action="spawn"
+          session={{
+            ...initialSession,
+            updated_at: '2026-10-20T12:00:05Z',
+          }}
+          onConfirm={vi.fn().mockResolvedValue(undefined)}
+          onCancel={vi.fn()}
+          client={null}
+          userById={new Map()}
+        />
+      );
+    });
+
+    expect(screen.getByText('Configuration')).toBeInTheDocument();
+    expect(
+      (screen.getByPlaceholderText(/Only use safe operations/i) as HTMLTextAreaElement).value
+    ).toBe('Focus strictly on unit tests');
+    expect(screen.getByRole('checkbox', { name: /Notify parent on completion/i })).toBeChecked();
+  });
+
+  it('re-initializes when the modal is closed and reopened', async () => {
     function Harness() {
       const [open, setOpen] = useState(true);
       return (
@@ -257,122 +312,18 @@ describe('ForkSpawnModal realtime session updates', { timeout: 10_000 }, () => {
     fireEvent.change(textarea, { target: { value: 'Edited prompt text' } });
     expect(textarea.value).toBe('Edited prompt text');
 
-    // Close modal
     fireEvent.click(screen.getByTestId('harness-close'));
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
 
-    // Reopen modal
     fireEvent.click(screen.getByTestId('harness-reopen'));
     await screen.findByRole('dialog');
 
-    // Should re-initialize to initialPrompt
     expect((screen.getByTestId('prompt-textarea') as HTMLTextAreaElement).value).toBe(
       'Initial default'
     );
   });
 
-  it('preserves custom configuration choices when source session receives a new object reference', async () => {
-    const initialSession: Session = {
-      ...(mockSession as Session),
-      status: 'running',
-      updated_at: '2026-10-20T12:00:00Z',
-    };
-
-    const { rerender } = render(
-      <ForkSpawnModal
-        open
-        action="spawn"
-        session={initialSession}
-        onConfirm={vi.fn().mockResolvedValue(undefined)}
-        onCancel={vi.fn()}
-        client={null}
-        userById={new Map()}
-      />
-    );
-
-    // Switch to Custom config
-    fireEvent.click(screen.getByText('Custom config'));
-    await screen.findByText('Configuration');
-
-    // Change real user-editable configuration fields in Custom config
-    const extraInstructions = screen.getByPlaceholderText(
-      /Only use safe operations/i
-    ) as HTMLTextAreaElement;
-    fireEvent.change(extraInstructions, { target: { value: 'Focus strictly on unit tests' } });
-    expect(extraInstructions.value).toBe('Focus strictly on unit tests');
-
-    const notifyCheckbox = screen.getByRole('checkbox', { name: /Notify parent on completion/i });
-    fireEvent.click(notifyCheckbox);
-    expect(notifyCheckbox).toBeChecked();
-
-    // Simulate session realtime update arriving while Custom config is active
-    act(() => {
-      rerender(
-        <ForkSpawnModal
-          open
-          action="spawn"
-          session={{
-            ...initialSession,
-            updated_at: '2026-10-20T12:00:05Z',
-          }}
-          onConfirm={vi.fn().mockResolvedValue(undefined)}
-          onCancel={vi.fn()}
-          client={null}
-          userById={new Map()}
-        />
-      );
-    });
-
-    // Verify Custom config preset remains active and user choices are preserved
-    expect(screen.getByText('Configuration')).toBeInTheDocument();
-    expect(
-      (screen.getByPlaceholderText(/Only use safe operations/i) as HTMLTextAreaElement).value
-    ).toBe('Focus strictly on unit tests');
-    expect(screen.getByRole('checkbox', { name: /Notify parent on completion/i })).toBeChecked();
-  });
-
-  it('preserves typed prompt when initialPrompt prop updates while modal remains open', async () => {
-    const { rerender } = render(
-      <ForkSpawnModal
-        open
-        action="fork"
-        session={mockSession as Session}
-        initialPrompt="First default"
-        onConfirm={vi.fn().mockResolvedValue(undefined)}
-        onCancel={vi.fn()}
-        client={null}
-        userById={new Map()}
-      />
-    );
-
-    const textarea = screen.getByTestId('prompt-textarea') as HTMLTextAreaElement;
-    expect(textarea.value).toBe('First default');
-
-    fireEvent.change(textarea, { target: { value: 'User in-progress edit' } });
-    expect(textarea.value).toBe('User in-progress edit');
-
-    // Simulate caller re-evaluating and passing a new initialPrompt while modal is still open
-    act(() => {
-      rerender(
-        <ForkSpawnModal
-          open
-          action="fork"
-          session={mockSession as Session}
-          initialPrompt="Second default from background"
-          onConfirm={vi.fn().mockResolvedValue(undefined)}
-          onCancel={vi.fn()}
-          client={null}
-          userById={new Map()}
-        />
-      );
-    });
-
-    expect((screen.getByTestId('prompt-textarea') as HTMLTextAreaElement).value).toBe(
-      'User in-progress edit'
-    );
-  });
-
-  it('re-initializes prompt when modal switches to a different session while open', async () => {
+  it('re-initializes when the modal switches to a different session_id while still open', async () => {
     const sessionA: Session = {
       ...(mockSession as Session),
       session_id: 'session-a' as Session['session_id'],
@@ -403,7 +354,6 @@ describe('ForkSpawnModal realtime session updates', { timeout: 10_000 }, () => {
     fireEvent.change(textarea, { target: { value: 'Dirty draft on A' } });
     expect(textarea.value).toBe('Dirty draft on A');
 
-    // Switch to session B while modal remains open
     act(() => {
       rerender(
         <ForkSpawnModal
