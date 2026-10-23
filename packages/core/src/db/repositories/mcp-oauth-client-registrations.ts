@@ -478,13 +478,7 @@ export class MCPOAuthClientRegistrationRepository {
     }
   }
 
-  /**
-   * Invalidate the current registration only if its decrypted client_id matches
-   * the client_id that failed token refresh or token exchange.
-   *
-   * A slow refresh that failed with invalid_client must never invalidate a newer
-   * replacement registration that another replica or concurrent reconnect has already published.
-   */
+  // Only invalidate if this client_id is still current (avoids clobbering a newer registration)
   async invalidateIfCurrentMatchesClientId(input: {
     tenantId: string;
     serverId: MCPServerID;

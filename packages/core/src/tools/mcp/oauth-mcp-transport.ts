@@ -1815,14 +1815,14 @@ async function resolveOAuthClient(options: {
     ? 'metadata'
     : 'legacy_fallback';
   try {
-    const wasInLocalCache =
+    const inLocalCache =
       !options.resolveDynamicClientRegistration &&
       options.reuseDynamicClientRegistration !== false &&
       dynamicClientCache.get(registrationEndpoint)?.redirect_uri === options.actualRedirectUri;
 
-    let freshlyRegistered = false;
+    let didRegister = false;
     const register = async () => {
-      freshlyRegistered = true;
+      didRegister = true;
       return registerDynamicClient(
         registrationEndpoint,
         options.actualRedirectUri,
@@ -1861,14 +1861,12 @@ async function resolveOAuthClient(options: {
         })
       : resolved.registration;
     options.assertCurrent?.();
-    const isCached = options.resolveDynamicClientRegistration
-      ? !freshlyRegistered
-      : Boolean(wasInLocalCache);
+    const cached = options.resolveDynamicClientRegistration ? !didRegister : inLocalCache;
     return {
       clientId: registration.client_id,
       ...(registration.client_secret ? { clientSecret: registration.client_secret } : {}),
       method: 'dynamic_registration',
-      cached: isCached,
+      cached: Boolean(cached),
       ...(resolved.registrationId ? { clientRegistrationId: resolved.registrationId } : {}),
       registeredRedirectUri: options.actualRedirectUri,
       clientName: MCP_OAUTH_DCR_CLIENT_NAME,
@@ -2361,8 +2359,7 @@ async function startMCPOAuthFlowWithAS(opts: {
     authUrl.searchParams.set('scope', scopeString);
   }
 
-  // Preflight check: if a cached dynamic client is rejected by /authorize (HTTP 400 + stale client signal),
-  // invalidate the stale registration and retry DCR once.
+  // Bounded probe (timeout + safeOutboundFetch) only for cached dynamic clients to detect forgotten registrations before browser redirect.
   if (resolvedClient.method === 'dynamic_registration' && resolvedClient.cached) {
     const probe = await checkAuthorizeProbe(authUrl.toString(), allowLocalhostHttp);
     if (probe.isStale) {
@@ -2405,7 +2402,7 @@ async function startMCPOAuthFlowWithAS(opts: {
       if (retryProbe.isStale) {
         throw new OAuthConfigurationError(
           'client_registration_required',
-          'The authorization server rejected the freshly registered dynamic client. Start a new OAuth flow.'
+          'The authorization server rejected the client even after re-registration. Try connecting again.'
         );
       }
     }
