@@ -601,7 +601,11 @@ async function refreshPostgres(deps: RefreshAndPersistDeps): Promise<string> {
               serverId: deps.mcpServerId,
               clientId: row.oauth_client_id!,
             })
-          ).catch(() => undefined);
+          ).catch(() => {
+            console.warn(
+              `[MCP OAuth Refresh] event=dcr_invalidation_failed server_id=${deps.mcpServerId} reason=database_error`
+            );
+          });
         }
         const deleted = await tenantWork(deps, (db) =>
           new UserMCPOAuthTokenRepository(db).deleteClaimedInvalidGrant(
@@ -757,7 +761,11 @@ async function refreshStandalone(
             serverId: deps.mcpServerId,
             clientId: row.oauth_client_id!,
           });
-        }).catch(() => undefined);
+        }).catch(() => {
+          console.warn(
+            `[MCP OAuth Refresh] event=dcr_invalidation_failed server_id=${deps.mcpServerId} reason=database_error`
+          );
+        });
       }
       const deleted = await userTokenWork((repo) =>
         repo.deleteGrantVersion(

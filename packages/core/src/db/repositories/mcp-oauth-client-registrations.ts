@@ -493,8 +493,12 @@ export class MCPOAuthClientRegistrationRepository {
   }): Promise<boolean> {
     const masterSecret = input.masterSecret ?? process.env.AGOR_MASTER_SECRET;
     if (!masterSecret) {
+      console.warn(
+        `[MCP OAuth Refresh] event=dcr_invalidation_failed server_id=${input.serverId} reason=missing_master_secret`
+      );
       return false;
     }
+    let row: Record<string, unknown> | undefined;
     try {
       const currentResult = await executeRaw(
         this.db,
@@ -506,10 +510,18 @@ export class MCPOAuthClientRegistrationRepository {
             LIMIT 1
             FOR UPDATE`
       );
-      const row = rawRows(currentResult)[0];
-      if (!row || typeof row.sealed_material !== 'string') {
-        return false;
-      }
+      row = rawRows(currentResult)[0];
+    } catch {
+      console.warn(
+        `[MCP OAuth Refresh] event=dcr_invalidation_failed server_id=${input.serverId} reason=database_error`
+      );
+      return false;
+    }
+    if (!row || typeof row.sealed_material !== 'string') {
+      return false;
+    }
+    let parsed: { clientId?: string };
+    try {
       const binding = dcrRegistrationBinding({
         tenantId: input.tenantId,
         mcpServerId: input.serverId,
@@ -517,16 +529,26 @@ export class MCPOAuthClientRegistrationRepository {
         bindingFingerprint: String(row.binding_fingerprint),
       });
       const decrypted = openBoundSecret(row.sealed_material, masterSecret, 'dcr-client', binding);
-      const parsed = JSON.parse(decrypted) as { clientId?: string };
-      if (parsed.clientId !== input.clientId) {
-        return false;
-      }
+      parsed = JSON.parse(decrypted) as { clientId?: string };
+    } catch {
+      console.warn(
+        `[MCP OAuth Refresh] event=dcr_invalidation_failed server_id=${input.serverId} reason=envelope_error`
+      );
+      return false;
+    }
+    if (parsed.clientId !== input.clientId) {
+      return false;
+    }
+    try {
       return await this.invalidateRegisteredById({
         tenantId: input.tenantId,
         serverId: input.serverId,
         registrationId: row.registration_id as MCPOAuthClientRegistrationID,
       });
     } catch {
+      console.warn(
+        `[MCP OAuth Refresh] event=dcr_invalidation_failed server_id=${input.serverId} reason=database_error`
+      );
       return false;
     }
   }
