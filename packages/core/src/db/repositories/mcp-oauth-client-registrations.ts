@@ -478,7 +478,8 @@ export class MCPOAuthClientRegistrationRepository {
     }
   }
 
-  // Only invalidate if this client_id is still current (avoids clobbering a newer registration)
+  // Only invalidate if this client_id is still current (avoids clobbering a newer registration).
+  // Caller must execute inside a tenant transaction so the FOR UPDATE row lock holds until update.
   async invalidateIfCurrentMatchesClientId(input: {
     tenantId: string;
     serverId: MCPServerID;
@@ -487,33 +488,24 @@ export class MCPOAuthClientRegistrationRepository {
   }): Promise<boolean> {
     const masterSecret = input.masterSecret ?? process.env.AGOR_MASTER_SECRET;
     if (!masterSecret) {
-      console.warn(
-        `[MCP OAuth Refresh] event=dcr_invalidation_failed server_id=${input.serverId} reason=missing_master_secret`
-      );
       return false;
     }
-    let row: Record<string, unknown> | undefined;
-    try {
-      const currentResult = await executeRaw(
-        this.db,
-        sql`SELECT registration_id, binding_fingerprint, sealed_material
-            FROM mcp_oauth_client_registrations
-            WHERE tenant_id = ${input.tenantId}
-              AND mcp_server_id = ${input.serverId}
-              AND status = 'registered' AND is_current = true
-            LIMIT 1
-            FOR UPDATE`
-      );
-      row = rawRows(currentResult)[0];
-    } catch {
-      console.warn(
-        `[MCP OAuth Refresh] event=dcr_invalidation_failed server_id=${input.serverId} reason=database_error`
-      );
-      return false;
-    }
+
+    const currentResult = await executeRaw(
+      this.db,
+      sql`SELECT registration_id, binding_fingerprint, sealed_material
+          FROM mcp_oauth_client_registrations
+          WHERE tenant_id = ${input.tenantId}
+            AND mcp_server_id = ${input.serverId}
+            AND status = 'registered' AND is_current = true
+          LIMIT 1
+          FOR UPDATE`
+    );
+    const row = rawRows(currentResult)[0];
     if (!row || typeof row.sealed_material !== 'string') {
       return false;
     }
+
     let parsed: { clientId?: string };
     try {
       const binding = dcrRegistrationBinding({
@@ -525,26 +517,18 @@ export class MCPOAuthClientRegistrationRepository {
       const decrypted = openBoundSecret(row.sealed_material, masterSecret, 'dcr-client', binding);
       parsed = JSON.parse(decrypted) as { clientId?: string };
     } catch {
-      console.warn(
-        `[MCP OAuth Refresh] event=dcr_invalidation_failed server_id=${input.serverId} reason=envelope_error`
-      );
       return false;
     }
+
     if (parsed.clientId !== input.clientId) {
       return false;
     }
-    try {
-      return await this.invalidateRegisteredById({
-        tenantId: input.tenantId,
-        serverId: input.serverId,
-        registrationId: row.registration_id as MCPOAuthClientRegistrationID,
-      });
-    } catch {
-      console.warn(
-        `[MCP OAuth Refresh] event=dcr_invalidation_failed server_id=${input.serverId} reason=database_error`
-      );
-      return false;
-    }
+
+    return this.invalidateRegisteredById({
+      tenantId: input.tenantId,
+      serverId: input.serverId,
+      registrationId: row.registration_id as MCPOAuthClientRegistrationID,
+    });
   }
 
   async maintain(): Promise<{ abandoned: number; expired: number; purged: number }> {

@@ -5,6 +5,7 @@ import {
   isPostgresDatabase,
   isPostgresDatabaseHandle,
   runWithTenantDatabaseScope,
+  runWithTenantDatabaseTransaction,
 } from '../../db';
 import type { Database, TenantScopeAwareDatabase } from '../../db/client';
 import {
@@ -355,6 +356,7 @@ export interface RefreshAndPersistDeps {
   resolveTokenEndpointAuthMethod?: (
     server: MCPServer | null
   ) => Promise<MCPOAuthTokenEndpointAuthMethod | undefined>;
+  masterSecret?: string;
 }
 
 function exactGrantMatches(
@@ -595,11 +597,12 @@ async function refreshPostgres(deps: RefreshAndPersistDeps): Promise<string> {
       if (outcome === 'invalid') {
         const invalidClient = error instanceof InvalidGrantError && error.invalidClientRegistration;
         if (invalidClient && row.oauth_client_id) {
-          await tenantWork(deps, (db) =>
+          await runWithTenantDatabaseTransaction(deps.db, resolveTenantId(deps), (db) =>
             new MCPOAuthClientRegistrationRepository(db).invalidateIfCurrentMatchesClientId({
               tenantId: resolveTenantId(deps),
               serverId: deps.mcpServerId,
               clientId: row.oauth_client_id!,
+              masterSecret: deps.masterSecret,
             })
           ).catch(() => {
             console.warn(
@@ -754,12 +757,14 @@ async function refreshStandalone(
   } catch (error) {
     if (error instanceof InvalidGrantError) {
       if (error.invalidClientRegistration && row.oauth_client_id) {
-        await standaloneWork(deps, (db) => {
+        const tenantId = deps.tenantId ?? getCurrentTenantId() ?? 'default';
+        await runWithTenantDatabaseTransaction(deps.db, tenantId, (db) => {
           if (!isPostgresDatabase(db)) return Promise.resolve(false);
           return new MCPOAuthClientRegistrationRepository(db).invalidateIfCurrentMatchesClientId({
-            tenantId: deps.tenantId ?? getCurrentTenantId() ?? 'default',
+            tenantId,
             serverId: deps.mcpServerId,
             clientId: row.oauth_client_id!,
+            masterSecret: deps.masterSecret,
           });
         }).catch(() => {
           console.warn(

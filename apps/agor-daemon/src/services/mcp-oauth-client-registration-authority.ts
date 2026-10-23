@@ -438,7 +438,7 @@ export class MCPOAuthClientRegistrationAuthority {
     serverId: MCPServerID,
     clientId: string
   ): Promise<boolean> {
-    return runWithTenantDatabaseScope(this.db, tenantId, (scoped) =>
+    return runWithTenantDatabaseTransaction(this.db, tenantId, (scoped) =>
       new MCPOAuthClientRegistrationRepository(scoped).invalidateIfCurrentMatchesClientId({
         tenantId,
         serverId,

@@ -2170,22 +2170,55 @@ export async function validateMCPOAuthMetadata(
  * @param options.tokenUrlOverride - Override the auto-discovered token endpoint URL
  * @returns Authorization URL and flow context
  */
+function hasStaleClientOAuthError(
+  error: string,
+  description = '',
+  hasRegistrationLink = false
+): boolean {
+  const err = error.trim().toLowerCase();
+  const desc = description.trim().toLowerCase();
+  if (err === 'invalid_client' || err === 'unauthorized_client') return true;
+  if (err === 'invalid_request') return desc.includes('client') || hasRegistrationLink;
+  return false;
+}
+
+function isStaleClientAuthorizeLocation(locationHeader: string | null): boolean {
+  if (!locationHeader) return false;
+  try {
+    const loc = new URL(locationHeader, 'https://placeholder.invalid');
+    const check = (params: URLSearchParams) =>
+      hasStaleClientOAuthError(params.get('error') || '', params.get('error_description') || '');
+    return (
+      check(loc.searchParams) ||
+      (loc.hash ? check(new URLSearchParams(loc.hash.replace(/^#/, ''))) : false)
+    );
+  } catch {
+    return false;
+  }
+}
+
 function isStaleClientAuthorizeResponse(
   status: number,
   headers: Headers,
-  bodyJson?: { error?: string }
+  bodyJson?: { error?: string; error_description?: string }
 ): boolean {
+  if (status >= 300 && status < 400) {
+    return isStaleClientAuthorizeLocation(headers.get('location'));
+  }
   if (status !== 400) return false;
   const link = headers.get('link') || '';
   const hasRegistrationLink =
     /(?:^|;|\s)rel\s*=\s*["']?[^"';]*registration/i.test(link) ||
     link.toLowerCase().includes('rel="http://oauth.net/core/2.1/#registration"');
 
-  const error = typeof bodyJson?.error === 'string' ? bodyJson.error.trim().toLowerCase() : '';
-  const isInvalid =
-    error === 'invalid_request' || error === 'invalid_client' || error === 'unauthorized_client';
-
-  return hasRegistrationLink || isInvalid;
+  return (
+    hasRegistrationLink ||
+    hasStaleClientOAuthError(
+      bodyJson?.error || '',
+      bodyJson?.error_description || '',
+      hasRegistrationLink
+    )
+  );
 }
 
 async function checkAuthorizeProbe(
@@ -2199,21 +2232,18 @@ async function checkAuthorizeProbe(
       signal: AbortSignal.timeout(5000),
       allowLocalhostHttp,
     });
-    if (probeResponse.status === 400) {
-      let bodyJson: { error?: string } | undefined;
+    const status = probeResponse.status;
+    if (status >= 300 && status < 400) {
+      return { isStale: isStaleClientAuthorizeResponse(status, probeResponse.headers) };
+    }
+    if (status === 400) {
+      let bodyJson: { error?: string; error_description?: string } | undefined;
       try {
-        const text = await probeResponse.text();
-        bodyJson = JSON.parse(text) as { error?: string };
+        bodyJson = (await probeResponse.json()) as { error?: string; error_description?: string };
       } catch {
-        // Not JSON
+        // Non-JSON response body
       }
-      return {
-        isStale: isStaleClientAuthorizeResponse(
-          probeResponse.status,
-          probeResponse.headers,
-          bodyJson
-        ),
-      };
+      return { isStale: isStaleClientAuthorizeResponse(status, probeResponse.headers, bodyJson) };
     }
   } catch {
     // Network errors, timeouts, or unmocked URL in tests: proceed normally

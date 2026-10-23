@@ -954,6 +954,7 @@ describe.skipIf(!postgresUrl || !usesPostgresSchema)(
           validateGrant: async () => true,
           observedRefreshVersion: initialRefreshVersion(bound),
           allowLocalhostHttpDevelopment: true,
+          masterSecret,
         })
       ).rejects.toBeInstanceOf(InvalidGrantError);
 
