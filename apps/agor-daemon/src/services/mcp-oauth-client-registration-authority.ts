@@ -3,6 +3,7 @@
 import { createHmac, randomUUID } from 'node:crypto';
 import {
   BOUND_SECRET_ENVELOPE_VERSION,
+  dcrRegistrationBinding,
   executeRaw,
   generateId,
   type MCPOAuthClientRegistrationRecord,
@@ -49,19 +50,7 @@ export interface DurableMCPOAuthClientRegistrationInput
   serverConfigVersion: number;
 }
 
-function registrationBinding(material: {
-  tenantId: string;
-  registrationId: string;
-  mcpServerId: string;
-  bindingFingerprint: string;
-}): string {
-  return [
-    material.tenantId,
-    material.mcpServerId,
-    material.registrationId,
-    material.bindingFingerprint,
-  ].join('\0');
-}
+const registrationBinding = dcrRegistrationBinding;
 
 function bindingFingerprint(
   masterSecret: string,
@@ -440,6 +429,21 @@ export class MCPOAuthClientRegistrationAuthority {
         tenantId,
         serverId,
         registrationId,
+      })
+    );
+  }
+
+  async invalidateIfCurrentMatchesClientId(
+    tenantId: string,
+    serverId: MCPServerID,
+    clientId: string
+  ): Promise<boolean> {
+    return runWithTenantDatabaseScope(this.db, tenantId, (scoped) =>
+      new MCPOAuthClientRegistrationRepository(scoped).invalidateIfCurrentMatchesClientId({
+        tenantId,
+        serverId,
+        clientId,
+        masterSecret: this.masterSecret,
       })
     );
   }
