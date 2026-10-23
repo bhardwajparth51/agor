@@ -478,8 +478,15 @@ export class MCPOAuthClientRegistrationRepository {
     }
   }
 
-  // Only invalidate if this client_id is still current (avoids clobbering a newer registration).
-  // Caller must execute inside a tenant transaction so the FOR UPDATE row lock holds until update.
+  /**
+   * Match-under-lock invalidation: evicts the registration only if the currently
+   * active row still matches the target client_id. This prevents a slow callback
+   * or refresh failure from retiring a newer registration that a concurrent replica
+   * has already established.
+   *
+   * Caller must wrap this in an active tenant transaction so the FOR UPDATE row
+   * lock is held continuously until the status update completes.
+   */
   async invalidateIfCurrentMatchesClientId(input: {
     tenantId: string;
     serverId: MCPServerID;

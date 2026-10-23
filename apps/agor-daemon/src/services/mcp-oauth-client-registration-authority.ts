@@ -438,14 +438,22 @@ export class MCPOAuthClientRegistrationAuthority {
     serverId: MCPServerID,
     clientId: string
   ): Promise<boolean> {
-    return runWithTenantDatabaseTransaction(this.db, tenantId, (scoped) =>
-      new MCPOAuthClientRegistrationRepository(scoped).invalidateIfCurrentMatchesClientId({
+    return runWithTenantDatabaseTransaction(this.db, tenantId, async (scoped) => {
+      const invalidated = await new MCPOAuthClientRegistrationRepository(
+        scoped
+      ).invalidateIfCurrentMatchesClientId({
         tenantId,
         serverId,
         clientId,
         masterSecret: this.masterSecret,
-      })
-    );
+      });
+      if (invalidated) {
+        console.log(
+          `[MCP OAuth] event=oauth_dcr_invalidated server_id=${serverId} client_id=${clientId} trigger=authority`
+        );
+      }
+      return invalidated;
+    });
   }
 
   async maintain() {

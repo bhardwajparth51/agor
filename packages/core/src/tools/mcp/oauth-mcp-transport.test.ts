@@ -1885,7 +1885,8 @@ describe('/authorize preflight probe + stale client recovery', () => {
     expect(ctx.clientId).toBe('fresh-client-json');
   });
 
-  it('throws clean error if retry probe also fails with stale client signal', async () => {
+  it('throws actionable error and logs when retry probe also fails with stale client signal', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     __seedDynamicClientCacheForTests('https://auth.provider.example/oauth/register', {
       client_id: 'stale-client-1',
       redirect_uri: redirectUri,
@@ -1913,8 +1914,114 @@ describe('/authorize preflight probe + stale client recovery', () => {
     }) as unknown as typeof fetch;
 
     await expect(startMCPOAuthFlow('', undefined, redirectUri, prefetchedOptions)).rejects.toThrow(
-      OAuthConfigurationError
+      'The MCP server is rejecting the OAuth client registration. The server may have reset its client store. Please try reconnecting later or contact the MCP server operator.'
     );
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('event=oauth_preflight_retry_failed')
+    );
+  });
+
+  it('detects HTTP 400 with plain-text body containing "is not registered", invalidates and re-registers', async () => {
+    __seedDynamicClientCacheForTests('https://auth.provider.example/oauth/register', {
+      client_id: 'stale-client-fastmcp',
+      redirect_uri: redirectUri,
+    });
+
+    const invalidateFn = vi.fn().mockResolvedValue(true);
+    globalThis.fetch = vi.fn().mockImplementation(async (urlInput: unknown, init?: RequestInit) => {
+      const url = String(urlInput);
+      const method = init?.method ?? 'GET';
+
+      if (
+        url.startsWith('https://auth.provider.example/oauth/authorize') &&
+        url.includes('client_id=stale-client-fastmcp')
+      ) {
+        return new Response('Error: Client is not registered on this server', {
+          status: 400,
+          headers: { 'Content-Type': 'text/plain' },
+        });
+      }
+
+      if (url === 'https://auth.provider.example/oauth/register' && method === 'POST') {
+        return new Response(
+          JSON.stringify({ client_id: 'fresh-client-fastmcp', redirect_uris: [redirectUri] }),
+          { status: 201, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+
+      if (
+        url.startsWith('https://auth.provider.example/oauth/authorize') &&
+        url.includes('client_id=fresh-client-fastmcp')
+      ) {
+        return new Response(null, { status: 302, headers: { Location: '/login' } });
+      }
+
+      return new Response('Not found', { status: 404 });
+    }) as unknown as typeof fetch;
+
+    const ctx = await startMCPOAuthFlow('', undefined, redirectUri, {
+      ...prefetchedOptions,
+      invalidateDynamicClientRegistration: invalidateFn,
+    });
+
+    expect(invalidateFn).toHaveBeenCalledWith('stale-client-fastmcp');
+    expect(ctx.clientId).toBe('fresh-client-fastmcp');
+    expect(console.log).toHaveBeenCalledWith(
+      expect.stringContaining('event=oauth_preflight_stale_detected')
+    );
+    expect(console.log).toHaveBeenCalledWith(
+      expect.stringContaining('event=oauth_dcr_invalidated')
+    );
+    expect(console.log).toHaveBeenCalledWith(
+      expect.stringContaining('event=oauth_preflight_recovery_started')
+    );
+  });
+
+  it('detects HTTP 400 with statusText containing "is not registered", invalidates and re-registers', async () => {
+    __seedDynamicClientCacheForTests('https://auth.provider.example/oauth/register', {
+      client_id: 'stale-client-statustext',
+      redirect_uri: redirectUri,
+    });
+
+    const invalidateFn = vi.fn().mockResolvedValue(true);
+    globalThis.fetch = vi.fn().mockImplementation(async (urlInput: unknown, init?: RequestInit) => {
+      const url = String(urlInput);
+      const method = init?.method ?? 'GET';
+
+      if (
+        url.startsWith('https://auth.provider.example/oauth/authorize') &&
+        url.includes('client_id=stale-client-statustext')
+      ) {
+        return new Response('', {
+          status: 400,
+          statusText: 'OAuth client is not registered',
+        });
+      }
+
+      if (url === 'https://auth.provider.example/oauth/register' && method === 'POST') {
+        return new Response(
+          JSON.stringify({ client_id: 'fresh-client-statustext', redirect_uris: [redirectUri] }),
+          { status: 201, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+
+      if (
+        url.startsWith('https://auth.provider.example/oauth/authorize') &&
+        url.includes('client_id=fresh-client-statustext')
+      ) {
+        return new Response(null, { status: 302, headers: { Location: '/login' } });
+      }
+
+      return new Response('Not found', { status: 404 });
+    }) as unknown as typeof fetch;
+
+    const ctx = await startMCPOAuthFlow('', undefined, redirectUri, {
+      ...prefetchedOptions,
+      invalidateDynamicClientRegistration: invalidateFn,
+    });
+
+    expect(invalidateFn).toHaveBeenCalledWith('stale-client-statustext');
+    expect(ctx.clientId).toBe('fresh-client-statustext');
   });
 
   it('proceeds normally to browser when probe returns 200 or 302 redirect', async () => {

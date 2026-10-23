@@ -595,16 +595,26 @@ async function refreshPostgres(deps: RefreshAndPersistDeps): Promise<string> {
     },
     async settle({ row, fence }, outcome, error) {
       if (outcome === 'invalid') {
+        // Provider rejected the client credentials (invalid_client / unauthorized_client).
+        // Evict the stale DCR registration so the next connect starts clean with a fresh client
+        // rather than repeating doomed refresh or authorization attempts.
         const invalidClient = error instanceof InvalidGrantError && error.invalidClientRegistration;
         if (invalidClient && row.oauth_client_id) {
-          await runWithTenantDatabaseTransaction(deps.db, resolveTenantId(deps), (db) =>
-            new MCPOAuthClientRegistrationRepository(db).invalidateIfCurrentMatchesClientId({
+          await runWithTenantDatabaseTransaction(deps.db, resolveTenantId(deps), async (db) => {
+            const invalidated = await new MCPOAuthClientRegistrationRepository(
+              db
+            ).invalidateIfCurrentMatchesClientId({
               tenantId: resolveTenantId(deps),
               serverId: deps.mcpServerId,
               clientId: row.oauth_client_id!,
               masterSecret: deps.masterSecret,
-            })
-          ).catch(() => {
+            });
+            if (invalidated) {
+              console.log(
+                `[MCP OAuth] event=oauth_dcr_invalidated server_id=${deps.mcpServerId} client_id=${row.oauth_client_id} trigger=refresh`
+              );
+            }
+          }).catch(() => {
             console.warn(
               `[MCP OAuth Refresh] event=dcr_invalidation_failed server_id=${deps.mcpServerId} reason=database_error`
             );
@@ -758,14 +768,21 @@ async function refreshStandalone(
     if (error instanceof InvalidGrantError) {
       if (error.invalidClientRegistration && row.oauth_client_id) {
         const tenantId = deps.tenantId ?? getCurrentTenantId() ?? 'default';
-        await runWithTenantDatabaseTransaction(deps.db, tenantId, (db) => {
+        await runWithTenantDatabaseTransaction(deps.db, tenantId, async (db) => {
           if (!isPostgresDatabase(db)) return Promise.resolve(false);
-          return new MCPOAuthClientRegistrationRepository(db).invalidateIfCurrentMatchesClientId({
+          const invalidated = await new MCPOAuthClientRegistrationRepository(
+            db
+          ).invalidateIfCurrentMatchesClientId({
             tenantId,
             serverId: deps.mcpServerId,
             clientId: row.oauth_client_id!,
             masterSecret: deps.masterSecret,
           });
+          if (invalidated) {
+            console.log(
+              `[MCP OAuth] event=oauth_dcr_invalidated server_id=${deps.mcpServerId} client_id=${row.oauth_client_id} trigger=refresh`
+            );
+          }
         }).catch(() => {
           console.warn(
             `[MCP OAuth Refresh] event=dcr_invalidation_failed server_id=${deps.mcpServerId} reason=database_error`

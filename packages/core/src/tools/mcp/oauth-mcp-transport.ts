@@ -2170,6 +2170,9 @@ export async function validateMCPOAuthMetadata(
  * @param options.tokenUrlOverride - Override the auto-discovered token endpoint URL
  * @returns Authorization URL and flow context
  */
+/** Bounded preflight probe timeout to verify cached DCR clients before opening the browser. */
+const OAUTH_AUTHORIZE_PREFLIGHT_TIMEOUT_MS = 5_000;
+
 function hasStaleClientOAuthError(
   error: string,
   description = '',
@@ -2197,15 +2200,37 @@ function isStaleClientAuthorizeLocation(locationHeader: string | null): boolean 
   }
 }
 
+/**
+ * Detects whether an authorization endpoint response indicates an unregistered / stale client.
+ *
+ * Signals recognized:
+ * 1. 3xx redirect Location (query or fragment) with error=invalid_client / unauthorized_client.
+ * 2. HTTP 400 containing OAuth 2.1 registration Link header (rel="...#registration").
+ * 3. HTTP 400 with plain-text body or statusText containing "is not registered" (e.g. FastMCP / Cloudflare).
+ * 4. HTTP 400 with JSON error: invalid_client, unauthorized_client, or invalid_request indicating client issues.
+ */
 function isStaleClientAuthorizeResponse(
   status: number,
   headers: Headers,
+  statusText?: string,
+  rawBody?: string,
   bodyJson?: { error?: string; error_description?: string }
 ): boolean {
   if (status >= 300 && status < 400) {
     return isStaleClientAuthorizeLocation(headers.get('location'));
   }
   if (status !== 400) return false;
+
+  const statusTextLower = (statusText || '').toLowerCase();
+  if (statusTextLower.includes('is not registered')) {
+    return true;
+  }
+
+  const rawBodyLower = (rawBody || '').toLowerCase();
+  if (rawBodyLower.includes('is not registered')) {
+    return true;
+  }
+
   const link = headers.get('link') || '';
   const hasRegistrationLink =
     /(?:^|;|\s)rel\s*=\s*["']?[^"';]*registration/i.test(link) ||
@@ -2229,7 +2254,7 @@ async function checkAuthorizeProbe(
     const probeResponse = await safeOutboundFetch(url, {
       method: 'GET',
       redirect: 'manual',
-      signal: AbortSignal.timeout(5000),
+      signal: AbortSignal.timeout(OAUTH_AUTHORIZE_PREFLIGHT_TIMEOUT_MS),
       allowLocalhostHttp,
     });
     const status = probeResponse.status;
@@ -2237,13 +2262,23 @@ async function checkAuthorizeProbe(
       return { isStale: isStaleClientAuthorizeResponse(status, probeResponse.headers) };
     }
     if (status === 400) {
+      let rawText = '';
       let bodyJson: { error?: string; error_description?: string } | undefined;
       try {
-        bodyJson = (await probeResponse.json()) as { error?: string; error_description?: string };
+        rawText = await probeResponse.text();
+        bodyJson = JSON.parse(rawText) as { error?: string; error_description?: string };
       } catch {
-        // Non-JSON response body
+        // Plain text or unparseable JSON
       }
-      return { isStale: isStaleClientAuthorizeResponse(status, probeResponse.headers, bodyJson) };
+      return {
+        isStale: isStaleClientAuthorizeResponse(
+          status,
+          probeResponse.headers,
+          probeResponse.statusText,
+          rawText,
+          bodyJson
+        ),
+      };
     }
   } catch {
     // Network errors, timeouts, or unmocked URL in tests: proceed normally
@@ -2389,19 +2424,30 @@ async function startMCPOAuthFlowWithAS(opts: {
     authUrl.searchParams.set('scope', scopeString);
   }
 
-  // Bounded probe (timeout + safeOutboundFetch) only for cached dynamic clients to detect forgotten registrations before browser redirect.
+  // Preflight check: bounded probe for cached dynamic clients to detect forgotten registrations before browser redirect.
   if (resolvedClient.method === 'dynamic_registration' && resolvedClient.cached) {
     const probe = await checkAuthorizeProbe(authUrl.toString(), allowLocalhostHttp);
     if (probe.isStale) {
       console.log(
-        `[MCP OAuth] Authorization endpoint rejected dynamic client (${resolvedClient.clientId}). Invalidating and re-registering.`
+        `[MCP OAuth] event=oauth_preflight_stale_detected client_id=${resolvedClient.clientId}`
       );
       if (opts.invalidateDynamicClientRegistration) {
-        await opts.invalidateDynamicClientRegistration(resolvedClient.clientId).catch(() => false);
+        const invalidated = await opts
+          .invalidateDynamicClientRegistration(resolvedClient.clientId)
+          .catch(() => false);
+        if (invalidated) {
+          console.log(
+            `[MCP OAuth] event=oauth_dcr_invalidated client_id=${resolvedClient.clientId} trigger=preflight`
+          );
+        }
       }
       if (resolvedClient.registrationEndpoint) {
         dynamicClientCache.delete(resolvedClient.registrationEndpoint);
       }
+
+      console.log(
+        `[MCP OAuth] event=oauth_preflight_recovery_started client_id=${resolvedClient.clientId}`
+      );
 
       resolvedClient = await resolveOAuthClient({
         clientId,
@@ -2430,9 +2476,12 @@ async function startMCPOAuthFlowWithAS(opts: {
 
       const retryProbe = await checkAuthorizeProbe(authUrl.toString(), allowLocalhostHttp);
       if (retryProbe.isStale) {
+        console.warn(
+          `[MCP OAuth] event=oauth_preflight_retry_failed client_id=${resolvedClient.clientId}`
+        );
         throw new OAuthConfigurationError(
           'client_registration_required',
-          'The authorization server rejected the client even after re-registration. Try connecting again.'
+          'The MCP server is rejecting the OAuth client registration. The server may have reset its client store. Please try reconnecting later or contact the MCP server operator.'
         );
       }
     }
